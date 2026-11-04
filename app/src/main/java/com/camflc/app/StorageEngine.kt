@@ -1,22 +1,19 @@
 package com.camflc.app
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color as AndroidColor
-import android.graphics.Paint
 import android.media.MediaScannerConnection
 import android.os.Environment
 import java.io.File
-import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 data class AlbumInfo(
     val name: String,
-    val path: String,
+    val relativePath: String,
+    val fullPath: String,
     val fileCount: Int,
+    val subFolderCount: Int,
     val sizeBytes: Long
 ) {
     fun formattedSize(): String {
@@ -32,57 +29,73 @@ data class AlbumInfo(
 
 object StorageEngine {
 
-    // Resolve o diretorio base real dentro do armazenamento interno (/storage/emulated/0/...)
-    fun resolveRootDir(baseRelativePath: String): File {
+    // Resolve o diretorio base sem criar pastas acidentais durante digitacao
+    fun resolveRootDir(baseRelativePath: String, createIfMissing: Boolean = true): File {
         val rootStorage = Environment.getExternalStorageDirectory()
-        val cleaned = baseRelativePath.trim().trimStart('/').ifEmpty { "DCIM/CamFLC" }
+        val cleaned = sanitizeRelativePath(baseRelativePath).ifEmpty { "DCIM/CamFLC" }
         val target = File(rootStorage, cleaned)
-        if (!target.exists()) {
+        if (createIfMissing && !target.exists()) {
             target.mkdirs()
         }
         return target
     }
 
-    // Garante que as pastas iniciais existam fisicamente no disco
-    fun ensureDefaultAlbums(baseRelativePath: String, defaultNames: List<String>) {
-        val root = resolveRootDir(baseRelativePath)
-        defaultNames.forEach { name ->
-            val clean = sanitizeFolderName(name)
-            if (clean.isNotEmpty()) {
-                val folder = File(root, clean)
-                if (!folder.exists()) {
-                    folder.mkdirs()
-                }
+    // Garante as pastas padrao apenas na raiz inicial caso esteja totalmente vazia
+    fun ensureDefaultAlbumsIfEmpty(baseRelativePath: String, defaultNames: List<String>) {
+        val root = resolveRootDir(baseRelativePath, createIfMissing = true)
+        val existingDirs = root.listFiles { f -> f.isDirectory }.orEmpty()
+        if (existingDirs.isEmpty()) {
+            defaultNames.forEach { name ->
+                File(root, sanitizeSingleName(name)).mkdirs()
             }
         }
     }
 
-    // Lista todas as pastas reais dentro do diretorio base com contagem de arquivos e tamanho
-    fun listAlbums(baseRelativePath: String): List<AlbumInfo> {
-        val root = resolveRootDir(baseRelativePath)
-        val subDirs = root.listFiles { file -> file.isDirectory }?.toList().orEmpty()
+    // Lista todas as pastas e subpastas recursivamente para troca em 1 toque
+    fun listAllAlbumsRecursively(baseRelativePath: String): List<AlbumInfo> {
+        val root = resolveRootDir(baseRelativePath, createIfMissing = true)
+        val result = mutableListOf<AlbumInfo>()
 
-        return subDirs.sortedBy { it.name.lowercase(Locale.getDefault()) }.map { folder ->
-            val mediaFiles = folder.listFiles { f ->
-                f.isFile && (f.name.endsWith(".jpg", true) ||
-                        f.name.endsWith(".jpeg", true) ||
-                        f.name.endsWith(".png", true) ||
-                        f.name.endsWith(".mp4", true))
-            }.orEmpty()
+        fun scanDir(dir: File, currentRelative: String) {
+            val childrenDirs = dir.listFiles { f -> f.isDirectory }
+                ?.sortedBy { it.name.lowercase(Locale.getDefault()) }
+                .orEmpty()
 
-            val totalBytes = mediaFiles.sumOf { it.length() }
-            AlbumInfo(
-                name = folder.name,
-                path = folder.absolutePath,
-                fileCount = mediaFiles.size,
-                sizeBytes = totalBytes
-            )
+            for (folder in childrenDirs) {
+                val relPath = if (currentRelative.isEmpty()) folder.name else "$currentRelative/${folder.name}"
+                val mediaFiles = folder.listFiles { f ->
+                    f.isFile && (f.name.endsWith(".jpg", true) ||
+                            f.name.endsWith(".jpeg", true) ||
+                            f.name.endsWith(".png", true) ||
+                            f.name.endsWith(".mp4", true))
+                }.orEmpty()
+                val subDirs = folder.listFiles { f -> f.isDirectory }.orEmpty()
+
+                result.add(
+                    AlbumInfo(
+                        name = folder.name,
+                        relativePath = relPath,
+                        fullPath = folder.absolutePath,
+                        fileCount = mediaFiles.size,
+                        subFolderCount = subDirs.size,
+                        sizeBytes = mediaFiles.sumOf { it.length() }
+                    )
+                )
+                // Varre subpastas ate 3 niveis de profundidade
+                if (relPath.count { it == '/' } < 3) {
+                    scanDir(folder, relPath)
+                }
+            }
         }
+
+        scanDir(root, "")
+        return result
     }
 
-    // Lista os nomes dos ultimos arquivos gravados dentro da pasta ativa
-    fun listRecentFilesInAlbum(baseRelativePath: String, albumName: String, limit: Int = 8): List<File> {
-        val albumDir = File(resolveRootDir(baseRelativePath), sanitizeFolderName(albumName))
+    // Lista os arquivos recentes da pasta/subpasta ativa
+    fun listRecentFilesInAlbum(baseRelativePath: String, albumRelativePath: String, limit: Int = 8): List<File> {
+        val root = resolveRootDir(baseRelativePath, createIfMissing = false)
+        val albumDir = File(root, sanitizeRelativePath(albumRelativePath))
         if (!albumDir.exists()) return emptyList()
         return albumDir.listFiles { f -> f.isFile }
             ?.sortedByDescending { it.lastModified() }
@@ -90,43 +103,84 @@ object StorageEngine {
             .orEmpty()
     }
 
-    // Cria uma nova pasta real no armazenamento
-    fun createAlbum(baseRelativePath: String, albumName: String): Boolean {
-        val clean = sanitizeFolderName(albumName)
-        if (clean.isEmpty()) return false
-        val folder = File(resolveRootDir(baseRelativePath), clean)
-        return if (folder.exists()) true else folder.mkdirs()
+    // Cria uma pasta na raiz ou uma subpasta dentro da pasta ativa (suporta caminhos como DESC/JF22JS35)
+    fun createAlbum(baseRelativePath: String, albumRelativePath: String): String? {
+        val cleanRel = sanitizeRelativePath(albumRelativePath)
+        if (cleanRel.isEmpty()) return null
+        val root = resolveRootDir(baseRelativePath, createIfMissing = true)
+        val folder = File(root, cleanRel)
+        val ok = if (folder.exists()) true else folder.mkdirs()
+        return if (ok) cleanRel else null
     }
 
-    // Renomeia uma pasta existente no disco
-    fun renameAlbum(baseRelativePath: String, oldName: String, newName: String): Boolean {
-        val cleanNew = sanitizeFolderName(newName)
-        if (cleanNew.isEmpty() || oldName == cleanNew) return false
-        val root = resolveRootDir(baseRelativePath)
-        val oldFolder = File(root, oldName)
-        val newFolder = File(root, cleanNew)
-        if (!oldFolder.exists() || newFolder.exists()) return false
-        return oldFolder.renameTo(newFolder)
+    // Renomeia a pasta ou subpasta ativa mantendo o mesmo nivel hierarquico
+    fun renameAlbum(baseRelativePath: String, oldRelativePath: String, newSingleName: String): String? {
+        val cleanNewName = sanitizeSingleName(newSingleName)
+        if (cleanNewName.isEmpty()) return null
+        val root = resolveRootDir(baseRelativePath, createIfMissing = false)
+        val oldFolder = File(root, sanitizeRelativePath(oldRelativePath))
+        if (!oldFolder.exists()) return null
+
+        val parentDir = oldFolder.parentFile ?: root
+        val newFolder = File(parentDir, cleanNewName)
+        if (newFolder.exists()) return null
+
+        return if (oldFolder.renameTo(newFolder)) {
+            val parentRel = oldRelativePath.substringBeforeLast("/", "")
+            if (parentRel.isEmpty()) cleanNewName else "$parentRel/$cleanNewName"
+        } else null
     }
 
-    // Exclui uma pasta e seus arquivos (apenas quando solicitado pelo usuario)
-    fun deleteAlbum(baseRelativePath: String, albumName: String): Boolean {
-        val root = resolveRootDir(baseRelativePath)
-        val target = File(root, albumName)
+    // Exclui uma pasta especifica
+    fun deleteAlbum(baseRelativePath: String, albumRelativePath: String): Boolean {
+        val root = resolveRootDir(baseRelativePath, createIfMissing = false)
+        val target = File(root, sanitizeRelativePath(albumRelativePath))
         if (!target.exists()) return false
         return target.deleteRecursively()
     }
 
-    // Cria o arquivo de midia de destino com Prefixo + DataHora (ex: OBRA_01_20261104_113022_120.jpg)
+    // FAXINA INTELIGENTE: Remove todas as pastas vazias (sem fotos) criadas acidentalmente em DCIM e na raiz ativa
+    fun cleanEmptyGhostFolders(baseRelativePath: String): Int {
+        var removedCount = 0
+        val dcimDir = File(Environment.getExternalStorageDirectory(), "DCIM")
+        val activeRoot = resolveRootDir(baseRelativePath, createIfMissing = false)
+
+        fun purgeEmptyRecursively(dir: File, isProtectedRoot: Boolean): Boolean {
+            if (!dir.exists() || !dir.isDirectory) return false
+            val children = dir.listFiles().orEmpty()
+            for (child in children) {
+                if (child.isDirectory) {
+                    purgeEmptyRecursively(child, isProtectedRoot = false)
+                }
+            }
+            val remaining = dir.listFiles().orEmpty()
+            if (remaining.isEmpty() && !isProtectedRoot) {
+                if (dir.delete()) {
+                    removedCount++
+                    return true
+                }
+            }
+            return false
+        }
+
+        // Limpa pastas vazias na raiz configurada e no DCIM geral (removendo J, JF, D, De, C, Ca, etc. que estejam vazias)
+        purgeEmptyRecursively(activeRoot, isProtectedRoot = true)
+        if (dcimDir.exists()) {
+            purgeEmptyRecursively(dcimDir, isProtectedRoot = true)
+        }
+        return removedCount
+    }
+
+    // Cria o arquivo final com Prefixo + DataHora dentro da pasta ou subpasta ativa
     fun createTargetMediaFile(
         baseRelativePath: String,
-        albumName: String,
+        albumRelativePath: String,
         prefix: String,
         extension: String = "jpg"
     ): File {
-        val root = resolveRootDir(baseRelativePath)
-        val cleanAlbum = sanitizeFolderName(albumName).ifEmpty { "Geral" }
-        val albumDir = File(root, cleanAlbum)
+        val root = resolveRootDir(baseRelativePath, createIfMissing = true)
+        val cleanAlbumRel = sanitizeRelativePath(albumRelativePath).ifEmpty { "Geral" }
+        val albumDir = File(root, cleanAlbumRel)
         if (!albumDir.exists()) {
             albumDir.mkdirs()
         }
@@ -137,56 +191,6 @@ object StorageEngine {
         return File(albumDir, fileName)
     }
 
-    // Gera um arquivo JPEG real no armazenamento (para validar escrita instantanea com Volume -)
-    fun generateQuickTestPhoto(
-        context: Context,
-        baseRelativePath: String,
-        albumName: String,
-        prefix: String
-    ): Result<File> {
-        return try {
-            val targetFile = createTargetMediaFile(baseRelativePath, albumName, prefix, "jpg")
-
-            val bitmap = Bitmap.createBitmap(1280, 720, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            canvas.drawColor(AndroidColor.BLACK)
-
-            val paintTitle = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = AndroidColor.rgb(255, 214, 0) // Amarelo Solar
-                textSize = 48f
-                isFakeBoldText = true
-            }
-            val paintBody = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = AndroidColor.WHITE
-                textSize = 34f
-            }
-            val paintGreen = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = AndroidColor.rgb(0, 230, 118)
-                textSize = 32f
-                isFakeBoldText = true
-            }
-
-            val nowStr = SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.getDefault()).format(Date())
-            canvas.drawText("CamFLC - TESTE DE ESCRITA FISICA", 60f, 140f, paintTitle)
-            canvas.drawText("Pasta / Album: $albumName", 60f, 240f, paintBody)
-            canvas.drawText("Arquivo: ${targetFile.name}", 60f, 320f, paintBody)
-            canvas.drawText("Data/Hora: $nowStr", 60f, 400f, paintBody)
-            canvas.drawText("Caminho: ${targetFile.parent}", 60f, 480f, paintGreen)
-
-            FileOutputStream(targetFile).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                out.flush()
-            }
-            bitmap.recycle()
-
-            indexFileInGallery(context, targetFile)
-            Result.success(targetFile)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    // Forca o Android a exibir a foto imediatamente na Galeria do celular
     fun indexFileInGallery(context: Context, file: File) {
         MediaScannerConnection.scanFile(
             context,
@@ -195,7 +199,18 @@ object StorageEngine {
         ) { _, _ -> }
     }
 
-    fun sanitizeFolderName(input: String): String {
+    // Permite barras '/' para suportar subpastas (ex: DESC/JF22JS35)
+    fun sanitizeRelativePath(input: String): String {
+        return input.trim()
+            .replace("\\", "/")
+            .replace(":", "_")
+            .split("/")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
+            .joinToString("/")
+    }
+
+    fun sanitizeSingleName(input: String): String {
         return input.trim()
             .replace("/", "_")
             .replace("\\", "_")
