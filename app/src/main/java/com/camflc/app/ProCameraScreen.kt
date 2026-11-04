@@ -3,6 +3,7 @@ package com.camflc.app
 import android.annotation.SuppressLint
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
+import android.media.MediaActionSound
 import android.view.MotionEvent
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -31,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -54,7 +56,7 @@ fun ProCameraScreen(
     lastCaptureLog: String,
     registerVolumeTrigger: ((() -> Unit)?) -> Unit,
     onSelectFolder: (String) -> Unit,
-    onCreateQuickFolder: (String) -> Unit,
+    onCreateQuickFolder: (String, Boolean) -> Unit,
     onPhotoSaved: (String) -> Unit,
     onLaunchNativeCamera: () -> Unit,
     vibrateFeedback: () -> Unit
@@ -63,15 +65,24 @@ fun ProCameraScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
 
-    // Controles de camera e hardware
+    // Som oficial de obturador nativo do Android para confirmar o instante exato da captura
+    val shutterSound = remember {
+        MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) }
+    }
+    DisposableEffect(Unit) {
+        onDispose { shutterSound.release() }
+    }
+
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var flashMode by remember { mutableIntStateOf(ImageCapture.FLASH_MODE_OFF) }
     var torchEnabled by remember { mutableStateOf(false) }
     var showGrid by remember { mutableStateOf(true) }
+
+    // Dialogo de nova pasta / subpasta direto no visor
     var showQuickNewFolderDialog by remember { mutableStateOf(false) }
+    var createAsSubfolder by remember { mutableStateOf(true) }
     var quickFolderText by remember { mutableStateOf("") }
 
-    // Estados lidos diretamente do hardware do dispositivo (CameraCharacteristics)
     var cameraInstance by remember { mutableStateOf<Camera?>(null) }
     var imageCaptureUseCase by remember { mutableStateOf<ImageCapture?>(null) }
     var sensorMaxMegapixels by remember { mutableStateOf("Calculando MP...") }
@@ -83,10 +94,15 @@ fun ProCameraScreen(
     var evMax by remember { mutableIntStateOf(0) }
     var currentEvIndex by remember { mutableIntStateOf(0) }
 
-    // Feedback visual de captura sob sol forte e indicador de foco
-    var captureBorderFlash by remember { mutableStateOf(false) }
-    var isCapturing by remember { mutableStateOf(false) }
-    var focusIndicatorText by remember { mutableStateOf("AF Contínuo") }
+    // Estado do Circulo Visual de Foco por Toque (Coordenadas X, Y + Status de Travamento)
+    var focusTouchPoint by remember { mutableStateOf<Offset?>(null) }
+    var focusIsLocked by remember { mutableStateOf(false) }
+    var focusIndicatorText by remember { mutableStateOf("Toque na imagem para focar") }
+    var focusSessionId by remember { mutableIntStateOf(0) }
+
+    // Estados Reais do Obturador:
+    // 0 = Pronto | 1 = Expondo Sensor (Segure Firme - Amarelo) | 2 = Captura Concluida (Pode Mover - Verde)
+    var shutterStage by remember { mutableIntStateOf(0) }
 
     val previewView = remember {
         PreviewView(context).apply {
@@ -95,7 +111,15 @@ fun ProCameraScreen(
         }
     }
 
-    // Inicializa o motor CameraX em Qualidade Maxima de Hardware
+    // Esconde o circulo de foco suavemente 1.5s apos travar
+    LaunchedEffect(focusSessionId) {
+        if (focusSessionId > 0) {
+            delay(1600)
+            focusTouchPoint = null
+        }
+    }
+
+    // Inicializa CameraX com Prioridade de Disparo Rapido (Zero-Lag) e Resolucao Maxima do Sensor
     LaunchedEffect(lensFacing) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
@@ -113,9 +137,10 @@ fun ProCameraScreen(
                     .build()
                     .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
+                // CAPTURE_MODE_MINIMIZE_LATENCY elimina o atraso entre o clique e a captura real da imagem
                 val imageCapture = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                    .setJpegQuality(100)
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .setJpegQuality(98)
                     .setResolutionSelector(resolutionSelector)
                     .setFlashMode(flashMode)
                     .build()
@@ -135,7 +160,6 @@ fun ProCameraScreen(
                 imageCaptureUseCase = imageCapture
                 torchEnabled = false
 
-                // Leitura de limites fisicos do sensor via Camera2Interop
                 val cam2Info = Camera2CameraInfo.from(cam.cameraInfo)
                 val map = cam2Info.getCameraCharacteristic(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
@@ -150,30 +174,50 @@ fun ProCameraScreen(
                     sensorMaxMegapixels = "Resolução Máxima Nativa"
                 }
 
-                // Limites de Zoom do aparelho
                 val zoomState = cam.cameraInfo.zoomState.value
                 minZoomRatio = zoomState?.minZoomRatio ?: 1f
                 maxZoomRatio = zoomState?.maxZoomRatio ?: 4f
                 currentZoomRatio = 1f
 
-                // Limites de Exposicao (EV) do sensor
                 val exposureState = cam.cameraInfo.exposureState
                 evMin = exposureState.exposureCompensationRange.lower
                 evMax = exposureState.exposureCompensationRange.upper
                 currentEvIndex = exposureState.exposureCompensationIndex
 
-                // Configura Toque para Focar (Tap-to-Focus + Fotometria no ponto)
+                // Toque para Focar com Circulo Visual no Ponto Exato (Amarelo -> Verde)
                 previewView.setOnTouchListener { view, motionEvent ->
                     if (motionEvent.action == MotionEvent.ACTION_UP) {
+                        val touchX = motionEvent.x
+                        val touchY = motionEvent.y
+
+                        focusTouchPoint = Offset(touchX, touchY)
+                        focusIsLocked = false
+                        focusSessionId++
+                        focusIndicatorText = "Focando..."
+
                         val factory = previewView.meteringPointFactory
-                        val point = factory.createPoint(motionEvent.x, motionEvent.y)
+                        val point = factory.createPoint(touchX, touchY)
                         val action = FocusMeteringAction.Builder(
                             point,
                             FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
                         ).build()
-                        cam.cameraControl.startFocusAndMetering(action)
-                        focusIndicatorText = "Foco Cravado (${motionEvent.x.roundToInt()}, ${motionEvent.y.roundToInt()})"
-                        vibrateFeedback()
+
+                        val future = cam.cameraControl.startFocusAndMetering(action)
+                        future.addListener({
+                            try {
+                                val result = future.get()
+                                focusIsLocked = result.isFocusSuccessful
+                                focusIndicatorText = if (result.isFocusSuccessful) {
+                                    "Foco Travado ✓"
+                                } else {
+                                    "Foco Ajustado"
+                                }
+                                vibrateFeedback()
+                            } catch (_: Exception) {
+                                focusIsLocked = true
+                            }
+                        }, ContextCompat.getMainExecutor(context))
+
                         view.performClick()
                     }
                     true
@@ -184,21 +228,16 @@ fun ProCameraScreen(
         }, ContextCompat.getMainExecutor(context))
     }
 
-    // Funcao de Captura Real Instantanea em JPEG 100% (Acionada pelo Botao na Tela ou Volume -)
+    // Funcao de Captura Sincronizada (So vibra e pisca Verde quando a imagem ja foi congelada!)
     val captureProPhoto: () -> Unit = {
         val captureUseCase = imageCaptureUseCase
-        if (captureUseCase != null && !isCapturing) {
-            isCapturing = true
-            vibrateFeedback()
-            coroutineScope.launch {
-                captureBorderFlash = true
-                delay(180)
-                captureBorderFlash = false
-            }
+        if (captureUseCase != null && shutterStage == 0) {
+            // Estagio 1: Avisa que o sensor esta lendo a luz (Sem vibrar antes da hora!)
+            shutterStage = 1
 
             val targetFile = StorageEngine.createTargetMediaFile(
                 baseRelativePath = baseDirectory,
-                albumName = activeFolder,
+                albumRelativePath = activeFolder,
                 prefix = filePrefix,
                 extension = "jpg"
             )
@@ -211,14 +250,22 @@ fun ProCameraScreen(
                 ContextCompat.getMainExecutor(context),
                 object : ImageCapture.OnImageSavedCallback {
                     override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                        isCapturing = false
+                        // Estagio 2: Quadro 100% capturado e salvo -> Toca Obturador + Vibra + Pisca Borda Verde!
+                        shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+                        vibrateFeedback()
+                        shutterStage = 2
+                        coroutineScope.launch {
+                            delay(300)
+                            shutterStage = 0
+                        }
+
                         StorageEngine.indexFileInGallery(context, targetFile)
                         val kb = targetFile.length() / 1024
-                        onPhotoSaved("FOTO PRO SALVA ($kb KB): ${targetFile.parentFile?.name}/${targetFile.name}")
+                        onPhotoSaved("✓ CAPTURA CONCLUÍDA ($kb KB): $activeFolder/${targetFile.name}")
                     }
 
                     override fun onError(exception: ImageCaptureException) {
-                        isCapturing = false
+                        shutterStage = 0
                         onPhotoSaved("ERRO NA CAPTURA: ${exception.message}")
                     }
                 }
@@ -226,32 +273,50 @@ fun ProCameraScreen(
         }
     }
 
-    // Conecta o gatilho fisico Volume - diretamente ao obturador da Camera Pro
     LaunchedEffect(activeFolder, filePrefix, baseDirectory, imageCaptureUseCase, flashMode) {
         registerVolumeTrigger(captureProPhoto)
     }
 
-    // Dialogo Rapido para Criar Nova Pasta Sem Sair do Visor da Camera
+    // Dialogo Rapido para Criar Pasta ou Subpasta Sem Sair do Visor
     if (showQuickNewFolderDialog) {
         AlertDialog(
             onDismissRequest = { showQuickNewFolderDialog = false },
             containerColor = SolarWhite,
             title = {
-                Text("NOVA PASTA NO VISOR", color = SolarBlack, fontWeight = FontWeight.ExtraBold)
+                Text(
+                    text = if (createAsSubfolder) "NOVA SUBPASTA EM '$activeFolder'" else "NOVA PASTA NA RAIZ",
+                    color = SolarBlack,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 16.sp
+                )
             },
             text = {
-                OutlinedTextField(
-                    value = quickFolderText,
-                    onValueChange = { quickFolderText = it },
-                    label = { Text("Nome da Nova Pasta/Álbum", fontWeight = FontWeight.Bold) },
-                    singleLine = true
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = createAsSubfolder,
+                            onClick = { createAsSubfolder = true },
+                            label = { Text("Subpasta de '$activeFolder'", fontWeight = FontWeight.Bold) }
+                        )
+                        FilterChip(
+                            selected = !createAsSubfolder,
+                            onClick = { createAsSubfolder = false },
+                            label = { Text("Na Raiz", fontWeight = FontWeight.Bold) }
+                        )
+                    }
+                    OutlinedTextField(
+                        value = quickFolderText,
+                        onValueChange = { quickFolderText = it },
+                        label = { Text("Nome (ex: JF22JS35)", fontWeight = FontWeight.Bold) },
+                        singleLine = true
+                    )
+                }
             },
             confirmButton = {
                 Button(
                     onClick = {
                         if (quickFolderText.isNotBlank()) {
-                            onCreateQuickFolder(quickFolderText)
+                            onCreateQuickFolder(quickFolderText, createAsSubfolder)
                             quickFolderText = ""
                             showQuickNewFolderDialog = false
                         }
@@ -274,7 +339,7 @@ fun ProCameraScreen(
             .fillMaxSize()
             .background(SolarBlack)
     ) {
-        // 1. HUD SUPERIOR SOLAR: Info do Sensor + Seletor Agil de Pastas em 1 Segundo
+        // 1. HUD SUPERIOR SOLAR: Sensor + Criador de Subpasta + Seletor de Pastas
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -288,20 +353,19 @@ fun ProCameraScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
-                    text = "SENSOR: $sensorMaxMegapixels • JPEG 100%",
+                    text = "SENSOR: $sensorMaxMegapixels",
                     color = SolarAmber,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.ExtraBold
                 )
                 Text(
                     text = focusIndicatorText,
-                    color = SolarGreen,
+                    color = if (focusIsLocked) SolarGreen else SolarAmber,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.ExtraBold
                 )
             }
 
-            // Carrossel de Pastas + Botao "+ Nova" direto no visor
             LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -312,7 +376,10 @@ fun ProCameraScreen(
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier
                             .height(42.dp)
-                            .clickable { showQuickNewFolderDialog = true }
+                            .clickable {
+                                createAsSubfolder = true
+                                showQuickNewFolderDialog = true
+                            }
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -320,27 +387,27 @@ fun ProCameraScreen(
                         ) {
                             Icon(Icons.Default.CreateNewFolder, contentDescription = null, tint = SolarBlack)
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("+ PASTA", color = SolarBlack, fontWeight = FontWeight.ExtraBold, fontSize = 13.sp)
+                            Text("+ SUBPASTA", color = SolarBlack, fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
                         }
                     }
                 }
 
                 items(albumsList) { album ->
-                    val isSelected = album.name == activeFolder
+                    val isSelected = album.relativePath == activeFolder
                     Surface(
                         color = if (isSelected) SolarAmber else Color(0xFF222222),
                         border = BorderStroke(2.dp, if (isSelected) SolarWhite else SolarAmber),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier
                             .height(42.dp)
-                            .clickable { onSelectFolder(album.name) }
+                            .clickable { onSelectFolder(album.relativePath) }
                     ) {
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier.padding(horizontal = 12.dp)
                         ) {
                             Text(
-                                text = "${album.name} (${album.fileCount})",
+                                text = "${album.relativePath} (${album.fileCount})",
                                 color = if (isSelected) SolarBlack else SolarWhite,
                                 fontWeight = FontWeight.ExtraBold,
                                 fontSize = 13.sp
@@ -351,35 +418,91 @@ fun ProCameraScreen(
             }
         }
 
-        // 2. VISOR OTICO CENTRAL COM GRADE 3x3 E BORDA DE CONFIRMACAO DE DISPARO
+        // 2. VISOR OTICO CENTRAL COM CIRCULO DE FOCO POR TOQUE E SINALIZADOR DE CAPTURA REAL
+        val borderColor = when (shutterStage) {
+            1 -> SolarAmber // Lendo sensor: Segure firme
+            2 -> SolarGreen // Foto salva: Pode mover!
+            else -> Color(0x66FFD600)
+        }
+        val borderWidth = if (shutterStage > 0) 8.dp else 2.dp
+
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .border(
-                    width = if (captureBorderFlash) 6.dp else 2.dp,
-                    color = if (captureBorderFlash) SolarGreen else SolarAmber
-                )
+                .border(width = borderWidth, color = borderColor)
         ) {
             AndroidView(
                 factory = { previewView },
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Grade Profissional de Enquadramento 3x3 (Regra dos Tercos)
-            if (showGrid) {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val w = size.width
-                    val h = size.height
-                    val gridColor = Color(0x88FFD600)
+            // Camada Grafica: Grade 3x3 + Circulo Visual de Foco no Ponto Tocado
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val w = size.width
+                val h = size.height
+
+                if (showGrid) {
+                    val gridColor = Color(0x66FFD600)
                     drawLine(gridColor, Offset(w / 3f, 0f), Offset(w / 3f, h), strokeWidth = 2f)
                     drawLine(gridColor, Offset(2f * w / 3f, 0f), Offset(2f * w / 3f, h), strokeWidth = 2f)
                     drawLine(gridColor, Offset(0f, h / 3f), Offset(w, h / 3f), strokeWidth = 2f)
                     drawLine(gridColor, Offset(0f, 2f * h / 3f), Offset(w, 2f * h / 3f), strokeWidth = 2f)
                 }
+
+                // Desenha o Circulo Habitual de Foco na coordenada exata do toque
+                focusTouchPoint?.let { centerPoint ->
+                    val ringColor = if (focusIsLocked) SolarGreen else SolarAmber
+                    val outerRadius = if (focusIsLocked) 85f else 105f
+
+                    // Sombra preta de contraste para visibilidade sob sol forte
+                    drawCircle(
+                        color = Color.Black.copy(alpha = 0.65f),
+                        radius = outerRadius + 6f,
+                        center = centerPoint,
+                        style = Stroke(width = 10f)
+                    )
+                    // Anel principal (Amarelo focando -> Verde travado)
+                    drawCircle(
+                        color = ringColor,
+                        radius = outerRadius,
+                        center = centerPoint,
+                        style = Stroke(width = 6f)
+                    )
+                    // Ponto central de mira
+                    drawCircle(
+                        color = ringColor,
+                        radius = 10f,
+                        center = centerPoint
+                    )
+                }
             }
 
-            // Pilula Flutuante de Prefixo e Status no Rodape do Visor
+            // Aviso Central de Captura Sincronizada (Evita mover o celular antes da hora)
+            if (shutterStage > 0) {
+                Surface(
+                    color = if (shutterStage == 1) SolarAmber else SolarGreen,
+                    border = BorderStroke(3.dp, SolarBlack),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 16.dp)
+                ) {
+                    Text(
+                        text = if (shutterStage == 1) {
+                            "CAPTURANDO... SEGURE FIRME"
+                        } else {
+                            "✓ FOTO CAPTURADA! PODE MOVER"
+                        },
+                        color = SolarBlack,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+            }
+
+            // Barra de Log Inferior
             Surface(
                 color = Color(0xD9000000),
                 border = BorderStroke(1.dp, SolarAmber),
@@ -398,7 +521,7 @@ fun ProCameraScreen(
             }
         }
 
-        // 3. PAINEL INFERIOR DE CONTROLES DE HARDWARE (ZOOM, EV, FLASH, LANTERNA E DISPARO)
+        // 3. PAINEL INFERIOR DE CONTROLES DE HARDWARE
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -406,13 +529,11 @@ fun ProCameraScreen(
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Linha de Zoom Rapido + Controles de Luz
             Row(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                // Seletores Rapidos de Zoom Fisico/Digital
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     val zoomSteps = buildList {
                         if (minZoomRatio < 0.95f) add(minZoomRatio)
@@ -446,9 +567,7 @@ fun ProCameraScreen(
                     }
                 }
 
-                // Botoes de Flash, Lanterna Continua (Torch), Grade e Lente Frontal/Traseira
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    // Alternar Flash de Disparo
                     OutlinedButton(
                         onClick = {
                             flashMode = when (flashMode) {
@@ -471,7 +590,6 @@ fun ProCameraScreen(
                         Text(flashLabel, color = SolarAmber, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                     }
 
-                    // Lanterna Continua (Torch) para ambientes escuros
                     OutlinedButton(
                         onClick = {
                             torchEnabled = !torchEnabled
@@ -493,7 +611,6 @@ fun ProCameraScreen(
                         )
                     }
 
-                    // Grade 3x3
                     IconButton(
                         onClick = { showGrid = !showGrid },
                         modifier = Modifier.size(36.dp)
@@ -505,7 +622,6 @@ fun ProCameraScreen(
                         )
                     }
 
-                    // Alternar Camera Traseira / Frontal
                     IconButton(
                         onClick = {
                             lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
@@ -521,7 +637,6 @@ fun ProCameraScreen(
                 }
             }
 
-            // Controle de Exposicao Manual (EV) para compensar sol forte ou contraluz
             if (evMin < evMax) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -554,7 +669,6 @@ fun ProCameraScreen(
                 }
             }
 
-            // Botao Principal de Captura Instantanea + Atalho Opcional Camera Nativa
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
@@ -562,7 +676,7 @@ fun ProCameraScreen(
                 Button(
                     onClick = captureProPhoto,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = SolarAmber,
+                        containerColor = if (shutterStage == 1) SolarWhite else SolarAmber,
                         contentColor = SolarBlack
                     ),
                     shape = RoundedCornerShape(14.dp),
@@ -573,7 +687,11 @@ fun ProCameraScreen(
                     Icon(Icons.Default.Camera, contentDescription = null, modifier = Modifier.size(28.dp))
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isCapturing) "GRAVANDO..." else "CAPTURAR (${activeFolder}) • VOL -",
+                        text = when (shutterStage) {
+                            1 -> "CAPTURANDO... SEGURE!"
+                            2 -> "✓ FOTO SALVA!"
+                            else -> "CAPTURAR ($activeFolder) • VOL -"
+                        },
                         fontSize = 15.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
