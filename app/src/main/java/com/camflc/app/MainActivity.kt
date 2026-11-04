@@ -39,7 +39,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
 
-// Paleta de Alto Contraste Solar (Outdoor-First)
 val SolarWhite = Color(0xFFFFFFFF)
 val SolarSurface = Color(0xFFF1F5F9)
 val SolarBlack = Color(0xFF000000)
@@ -105,7 +104,7 @@ fun CamFLCApp(
     var albumsList by remember { mutableStateOf<List<AlbumInfo>>(emptyList()) }
     var recentFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     var storageRefreshTick by remember { mutableIntStateOf(0) }
-    var lastCaptureLog by remember { mutableStateOf("Câmera Pro pronta para captura em resolução máxima.") }
+    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida sem atraso.") }
     var currentTab by remember { mutableIntStateOf(0) }
 
     var hasAllFilesAccess by remember {
@@ -151,7 +150,7 @@ fun CamFLCApp(
         try {
             val targetFile = StorageEngine.createTargetMediaFile(
                 baseRelativePath = baseDirectory,
-                albumName = activeFolder,
+                albumRelativePath = activeFolder,
                 prefix = filePrefix,
                 extension = "jpg"
             )
@@ -167,19 +166,19 @@ fun CamFLCApp(
         }
     }
 
+    // So recarrega pastas quando confirmado (nunca durante digitacao parcial!)
     LaunchedEffect(baseDirectory, activeFolder, storageRefreshTick) {
         val defaultFolders = listOf("Geral", "Inspecao", "Laudo_A", "Equipamentos")
-        StorageEngine.ensureDefaultAlbums(baseDirectory, defaultFolders)
-        val loaded = StorageEngine.listAlbums(baseDirectory)
+        StorageEngine.ensureDefaultAlbumsIfEmpty(baseDirectory, defaultFolders)
+        val loaded = StorageEngine.listAllAlbumsRecursively(baseDirectory)
         albumsList = loaded
-        if (loaded.none { it.name == activeFolder } && loaded.isNotEmpty()) {
-            activeFolder = loaded.first().name
+        if (loaded.none { it.relativePath == activeFolder } && loaded.isNotEmpty()) {
+            activeFolder = loaded.first().relativePath
             prefs.edit().putString("active_folder", activeFolder).apply()
         }
         recentFiles = StorageEngine.listRecentFilesInAlbum(baseDirectory, activeFolder)
     }
 
-    // Se o usuario apertar Volume - estando fora da aba da camera, abre a Camera Pro imediatamente
     LaunchedEffect(currentTab) {
         if (currentTab != 1) {
             registerVolumeTrigger {
@@ -246,9 +245,12 @@ fun CamFLCApp(
             when (currentTab) {
                 0 -> HomeStorageScreen(
                     baseDirectory = baseDirectory,
-                    onBaseDirChange = {
-                        baseDirectory = it
-                        prefs.edit().putString("base_dir", it).apply()
+                    onApplyBaseDir = { confirmedDir ->
+                        val cleaned = StorageEngine.sanitizeRelativePath(confirmedDir).ifEmpty { "DCIM/CamFLC" }
+                        baseDirectory = cleaned
+                        prefs.edit().putString("base_dir", cleaned).apply()
+                        vibrateFeedback()
+                        lastCaptureLog = "DIRETÓRIO BASE APLICADO: /storage/emulated/0/$cleaned"
                         storageRefreshTick++
                     },
                     filePrefix = filePrefix,
@@ -286,31 +288,34 @@ fun CamFLCApp(
                         ) == PackageManager.PERMISSION_GRANTED
                         storageRefreshTick++
                     },
-                    onSelectFolder = { folderName ->
-                        activeFolder = folderName
-                        prefs.edit().putString("active_folder", folderName).apply()
+                    onSelectFolder = { folderRelPath ->
+                        activeFolder = folderRelPath
+                        prefs.edit().putString("active_folder", folderRelPath).apply()
                         vibrateFeedback()
                         storageRefreshTick++
                     },
-                    onAddFolder = { newName ->
-                        val created = StorageEngine.createAlbum(baseDirectory, newName)
-                        if (created) {
-                            val clean = StorageEngine.sanitizeFolderName(newName)
-                            activeFolder = clean
-                            prefs.edit().putString("active_folder", clean).apply()
+                    onAddFolder = { inputName, asSubfolder ->
+                        val targetRel = if (asSubfolder && activeFolder.isNotBlank()) {
+                            "$activeFolder/${inputName.trim()}"
+                        } else {
+                            inputName.trim()
+                        }
+                        val createdRel = StorageEngine.createAlbum(baseDirectory, targetRel)
+                        if (createdRel != null) {
+                            activeFolder = createdRel
+                            prefs.edit().putString("active_folder", createdRel).apply()
                             vibrateFeedback()
-                            lastCaptureLog = "PASTA CRIADA: /storage/emulated/0/$baseDirectory/$clean"
+                            lastCaptureLog = "PASTA ATIVA CRIADA: $baseDirectory/$createdRel"
                             storageRefreshTick++
                         }
                     },
                     onRenameActiveFolder = { newName ->
-                        val renamed = StorageEngine.renameAlbum(baseDirectory, activeFolder, newName)
-                        if (renamed) {
-                            val clean = StorageEngine.sanitizeFolderName(newName)
-                            activeFolder = clean
-                            prefs.edit().putString("active_folder", clean).apply()
+                        val updatedRel = StorageEngine.renameAlbum(baseDirectory, activeFolder, newName)
+                        if (updatedRel != null) {
+                            activeFolder = updatedRel
+                            prefs.edit().putString("active_folder", updatedRel).apply()
                             vibrateFeedback()
-                            lastCaptureLog = "PASTA RENOMEADA PARA: $clean"
+                            lastCaptureLog = "PASTA RENOMEADA PARA: $updatedRel"
                             storageRefreshTick++
                         } else {
                             lastCaptureLog = "Não foi possível renomear a pasta."
@@ -327,6 +332,12 @@ fun CamFLCApp(
                         } else {
                             lastCaptureLog = "Mantenha pelo menos 1 pasta ativa."
                         }
+                    },
+                    onCleanGhostFolders = {
+                        val removed = StorageEngine.cleanEmptyGhostFolders(baseDirectory)
+                        vibrateFeedback()
+                        lastCaptureLog = "FAXINA CONCLUÍDA: $removed pastas vazias removidas com sucesso!"
+                        storageRefreshTick++
                     },
                     useNativeCameraFallback = useNativeCameraFallback,
                     onToggleNativeCamera = {
@@ -346,17 +357,22 @@ fun CamFLCApp(
                     useNativeCameraFallback = useNativeCameraFallback,
                     lastCaptureLog = lastCaptureLog,
                     registerVolumeTrigger = registerVolumeTrigger,
-                    onSelectFolder = { folder ->
-                        activeFolder = folder
-                        prefs.edit().putString("active_folder", folder).apply()
+                    onSelectFolder = { folderRel ->
+                        activeFolder = folderRel
+                        prefs.edit().putString("active_folder", folderRel).apply()
                         vibrateFeedback()
                         storageRefreshTick++
                     },
-                    onCreateQuickFolder = { newName ->
-                        if (StorageEngine.createAlbum(baseDirectory, newName)) {
-                            val clean = StorageEngine.sanitizeFolderName(newName)
-                            activeFolder = clean
-                            prefs.edit().putString("active_folder", clean).apply()
+                    onCreateQuickFolder = { newName, asSubfolder ->
+                        val targetRel = if (asSubfolder && activeFolder.isNotBlank()) {
+                            "$activeFolder/${newName.trim()}"
+                        } else {
+                            newName.trim()
+                        }
+                        val createdRel = StorageEngine.createAlbum(baseDirectory, targetRel)
+                        if (createdRel != null) {
+                            activeFolder = createdRel
+                            prefs.edit().putString("active_folder", createdRel).apply()
                             vibrateFeedback()
                             storageRefreshTick++
                         }
@@ -381,7 +397,7 @@ fun CamFLCApp(
 @Composable
 fun HomeStorageScreen(
     baseDirectory: String,
-    onBaseDirChange: (String) -> Unit,
+    onApplyBaseDir: (String) -> Unit,
     filePrefix: String,
     onPrefixChange: (String) -> Unit,
     albumsList: List<AlbumInfo>,
@@ -392,9 +408,10 @@ fun HomeStorageScreen(
     onRequestPermissions: () -> Unit,
     onRefreshPermissions: () -> Unit,
     onSelectFolder: (String) -> Unit,
-    onAddFolder: (String) -> Unit,
+    onAddFolder: (String, Boolean) -> Unit,
     onRenameActiveFolder: (String) -> Unit,
     onDeleteActiveFolder: () -> Unit,
+    onCleanGhostFolders: () -> Unit,
     useNativeCameraFallback: Boolean,
     onToggleNativeCamera: (Boolean) -> Unit,
     lastCaptureLog: String,
@@ -402,11 +419,13 @@ fun HomeStorageScreen(
     onLaunchNativeCamera: () -> Unit
 ) {
     var newFolderName by remember { mutableStateOf("") }
-    var renameFolderText by remember(activeFolder) { mutableStateOf(activeFolder) }
+    // Variavel em buffer para NAO criar pastas enquanto o usuario digita letra por letra
+    var draftBaseDir by remember(baseDirectory) { mutableStateOf(baseDirectory) }
+    var renameFolderText by remember(activeFolder) { mutableStateOf(activeFolder.substringAfterLast("/")) }
     var showManageFolderTools by remember { mutableStateOf(false) }
 
     val cleanPrefix = StorageEngine.sanitizePrefix(filePrefix)
-    val activeAlbumInfo = albumsList.find { it.name == activeFolder }
+    val activeAlbumInfo = albumsList.find { it.relativePath == activeFolder }
 
     Column(
         modifier = Modifier
@@ -432,12 +451,6 @@ fun HomeStorageScreen(
                         fontSize = 16.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
-                    Text(
-                        text = "Toque em 1. LIBERAR AGORA e depois em 2. ATUALIZAR para ativar todas as permissões.",
-                        color = SolarBlack,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold
-                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = onRequestPermissions,
@@ -458,6 +471,7 @@ fun HomeStorageScreen(
             }
         }
 
+        // Cabecalho de Alto Contraste com Hierarquia Completa de Subpastas
         Surface(
             color = SolarBlack,
             shape = RoundedCornerShape(12.dp),
@@ -472,13 +486,13 @@ fun HomeStorageScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Destino: /storage/emulated/0/$baseDirectory/$activeFolder/",
+                    text = "Destino Ativo: /storage/emulated/0/$baseDirectory/$activeFolder/",
                     color = SolarWhite,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Padrão: ${cleanPrefix}_AAAAMMDD_HHMMSS.jpg • (${activeAlbumInfo?.fileCount ?: 0} arq | ${activeAlbumInfo?.formattedSize() ?: "0 B"})",
+                    text = "Próximo Arquivo: ${cleanPrefix}_AAAAMMDD_HHMMSS.jpg • (${activeAlbumInfo?.fileCount ?: 0} arq)",
                     color = SolarGreen,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -521,6 +535,7 @@ fun HomeStorageScreen(
             }
         }
 
+        // 1. Gerenciador Agil de Pastas e Subpastas
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -534,46 +549,69 @@ fun HomeStorageScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "1. ÁLBUNS REAIS NO DISCO (1 TOQUE)",
+                        text = "1. PASTAS & SUBPASTAS (1 TOQUE)",
                         color = SolarBlack,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
                     TextButton(onClick = { showManageFolderTools = !showManageFolderTools }) {
                         Text(
-                            text = if (showManageFolderTools) "OCULTAR OPÇÕES" else "EDITAR PASTA",
+                            text = if (showManageFolderTools) "OCULTAR OPÇÕES" else "OPÇÕES / LIMPEZA",
                             color = SolarBlack,
                             fontWeight = FontWeight.ExtraBold
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                // Se estiver dentro de uma subpasta (ex: DESC/JF22JS35), mostra atalho para subir para a pasta pai
+                if (activeFolder.contains("/")) {
+                    val parentFolder = activeFolder.substringBeforeLast("/")
+                    OutlinedButton(
+                        onClick = { onSelectFolder(parentFolder) },
+                        border = BorderStroke(2.dp, SolarBlack),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                    ) {
+                        Icon(Icons.Default.ArrowUpward, contentDescription = null, tint = SolarBlack)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "VOLTAR PARA PASTA PAI: $parentFolder",
+                            color = SolarBlack,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                }
 
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     items(albumsList) { album ->
-                        val isSelected = album.name == activeFolder
+                        val isSelected = album.relativePath == activeFolder
+                        val isSubfolder = album.relativePath.contains("/")
                         Surface(
                             color = if (isSelected) SolarBlack else SolarWhite,
                             border = BorderStroke(2.dp, SolarBlack),
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier
-                                .height(58.dp)
-                                .clickable { onSelectFolder(album.name) }
+                                .height(60.dp)
+                                .clickable { onSelectFolder(album.relativePath) }
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.padding(horizontal = 14.dp)
                             ) {
                                 Icon(
-                                    imageVector = if (isSelected) Icons.Default.FolderSpecial else Icons.Default.Folder,
+                                    imageVector = when {
+                                        isSelected -> Icons.Default.FolderSpecial
+                                        isSubfolder -> Icons.Default.SubdirectoryArrowRight
+                                        else -> Icons.Default.Folder
+                                    },
                                     contentDescription = null,
                                     tint = if (isSelected) SolarAmber else SolarBlack
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Column {
                                     Text(
-                                        text = album.name,
+                                        text = album.relativePath,
                                         color = if (isSelected) SolarAmber else SolarBlack,
                                         fontSize = 15.sp,
                                         fontWeight = FontWeight.ExtraBold
@@ -592,29 +630,68 @@ fun HomeStorageScreen(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
+                // Campo unico intuitivo para criar Pasta na Raiz ou Subpasta dentro da Pasta Ativa
+                OutlinedTextField(
+                    value = newFolderName,
+                    onValueChange = { newFolderName = it },
+                    label = {
+                        Text(
+                            text = "Nome da Pasta ou Subpasta (ex: DESC ou DESC/JF22JS35)",
+                            fontWeight = FontWeight.Bold,
+                            color = SolarBlack
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    OutlinedTextField(
-                        value = newFolderName,
-                        onValueChange = { newFolderName = it },
-                        label = { Text("Novo Álbum/Pasta no Disco", fontWeight = FontWeight.Bold, color = SolarBlack) },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
+                    // Cria como Subpasta dentro da pasta atualmente selecionada
                     Button(
                         onClick = {
-                            onAddFolder(newFolderName)
-                            newFolderName = ""
+                            if (newFolderName.isNotBlank()) {
+                                onAddFolder(newFolderName, true)
+                                newFolderName = ""
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+                        border = BorderStroke(2.dp, SolarBlack),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
+                    ) {
+                        Icon(Icons.Default.SubdirectoryArrowRight, contentDescription = null)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "+ SUBPASTA EM '${activeFolder.substringAfterLast("/")}'",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 12.sp
+                        )
+                    }
+
+                    // Cria diretamente na Raiz
+                    Button(
+                        onClick = {
+                            if (newFolderName.isNotBlank()) {
+                                onAddFolder(newFolderName, false)
+                                newFolderName = ""
+                            }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = SolarBlack, contentColor = SolarAmber),
                         shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.height(56.dp)
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
                     ) {
                         Icon(Icons.Default.CreateNewFolder, contentDescription = null)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("CRIAR", fontWeight = FontWeight.ExtraBold)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("+ PASTA NA RAIZ", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
                     }
                 }
 
@@ -622,6 +699,26 @@ fun HomeStorageScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                     Divider(color = SolarBlack, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(12.dp))
+
+                    // Botao de Faxina em 1 Toque para apagar pastas vazias criadas por engano
+                    Button(
+                        onClick = onCleanGhostFolders,
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarGreen, contentColor = SolarBlack),
+                        border = BorderStroke(2.dp, SolarBlack),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                    ) {
+                        Icon(Icons.Default.CleaningServices, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "LIMPAR TODAS AS PASTAS VAZIAS (0 ARQ)",
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -629,7 +726,7 @@ fun HomeStorageScreen(
                         OutlinedTextField(
                             value = renameFolderText,
                             onValueChange = { renameFolderText = it },
-                            label = { Text("Renomear Pasta Ativa", fontWeight = FontWeight.Bold) },
+                            label = { Text("Renomear '$activeFolder'", fontWeight = FontWeight.Bold) },
                             singleLine = true,
                             modifier = Modifier.weight(1f)
                         )
@@ -641,7 +738,9 @@ fun HomeStorageScreen(
                             Text("RENOMEAR", fontWeight = FontWeight.ExtraBold)
                         }
                     }
+
                     Spacer(modifier = Modifier.height(8.dp))
+
                     OutlinedButton(
                         onClick = onDeleteActiveFolder,
                         border = BorderStroke(2.dp, SolarRed),
@@ -656,6 +755,7 @@ fun HomeStorageScreen(
             }
         }
 
+        // 2. Prefixo Padrao e Diretorio Base Com Confirmacao Explicita
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -667,7 +767,7 @@ fun HomeStorageScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "2. PREFIXO E LOCAL DE ARMAZENAMENTO",
+                    text = "2. PREFIXO E DIRETÓRIO BASE",
                     color = SolarBlack,
                     fontSize = 15.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -676,7 +776,7 @@ fun HomeStorageScreen(
                 OutlinedTextField(
                     value = filePrefix,
                     onValueChange = onPrefixChange,
-                    label = { Text("Prefixo Padrão dos Arquivos", fontWeight = FontWeight.Bold, color = SolarBlack) },
+                    label = { Text("Prefixo Padrão dos Arquivos (ex: JF22JS35)", fontWeight = FontWeight.Bold, color = SolarBlack) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -693,7 +793,10 @@ fun HomeStorageScreen(
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier
                                 .weight(1f)
-                                .clickable { onBaseDirChange(preset) }
+                                .clickable {
+                                    draftBaseDir = preset
+                                    onApplyBaseDir(preset)
+                                }
                         ) {
                             Text(
                                 text = preset.substringBefore("/"),
@@ -706,16 +809,34 @@ fun HomeStorageScreen(
                     }
                 }
 
-                OutlinedTextField(
-                    value = baseDirectory,
-                    onValueChange = onBaseDirChange,
-                    label = { Text("Caminho Base Personalizado", fontWeight = FontWeight.Bold, color = SolarBlack) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                // Campo com Botao APLICAR para nunca criar pastas parciais enquanto digita
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = draftBaseDir,
+                        onValueChange = { draftBaseDir = it },
+                        label = { Text("Caminho Base Personalizado", fontWeight = FontWeight.Bold, color = SolarBlack) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = { onApplyBaseDir(draftBaseDir) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (draftBaseDir != baseDirectory) SolarAmber else SolarBlack,
+                            contentColor = if (draftBaseDir != baseDirectory) SolarBlack else SolarAmber
+                        ),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.height(56.dp)
+                    ) {
+                        Text("APLICAR", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
             }
         }
 
+        // 3. Ultimos Arquivos Reais na Pasta/Subpasta Ativa
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -809,7 +930,7 @@ fun LanPlaceholderScreen(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "${albumsList.size} álbuns físicos • $totalFiles fotos prontas para transferência LAN",
+                    text = "${albumsList.size} pastas/subpastas • $totalFiles fotos prontas para rede",
                     color = SolarGreen,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.ExtraBold
