@@ -17,7 +17,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -103,14 +102,12 @@ fun CamFLCApp(
         mutableStateOf(prefs.getBoolean("use_native_fallback", true))
     }
 
-    // Estado real sincronizado com o sistema de arquivos do aparelho
     var albumsList by remember { mutableStateOf<List<AlbumInfo>>(emptyList()) }
     var recentFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     var storageRefreshTick by remember { mutableIntStateOf(0) }
-    var lastCaptureLog by remember { mutableStateOf("Pronto para gravar arquivos reais no dispositivo.") }
+    var lastCaptureLog by remember { mutableStateOf("Câmera Pro pronta para captura em resolução máxima.") }
     var currentTab by remember { mutableIntStateOf(0) }
 
-    // Verificacao de permissoes de Armazenamento Total (Android 11+) e Camera
     var hasAllFilesAccess by remember {
         mutableStateOf(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -134,7 +131,6 @@ fun CamFLCApp(
         storageRefreshTick++
     }
 
-    // Launcher para abrir a Camera Nativa do Sistema salvando direto na pasta e com prefixo
     var pendingNativeCameraFile by remember { mutableStateOf<File?>(null) }
     val nativeCameraLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicture()
@@ -143,7 +139,7 @@ fun CamFLCApp(
         if (success && file != null && file.exists()) {
             StorageEngine.indexFileInGallery(context, file)
             vibrateFeedback()
-            lastCaptureLog = "FOTO NATIVA SALVA: ${file.absolutePath} (${file.length() / 1024} KB)"
+            lastCaptureLog = "FOTO NATIVA SALVA: ${file.name} (${file.length() / 1024} KB)"
             storageRefreshTick++
         } else {
             file?.delete()
@@ -171,7 +167,6 @@ fun CamFLCApp(
         }
     }
 
-    // Atualiza as pastas reais do disco sempre que algo mudar
     LaunchedEffect(baseDirectory, activeFolder, storageRefreshTick) {
         val defaultFolders = listOf("Geral", "Inspecao", "Laudo_A", "Equipamentos")
         StorageEngine.ensureDefaultAlbums(baseDirectory, defaultFolders)
@@ -184,25 +179,14 @@ fun CamFLCApp(
         recentFiles = StorageEngine.listRecentFilesInAlbum(baseDirectory, activeFolder)
     }
 
-    // Funcao de Disparo Fisico (Volume -) gravando arquivo real no disco
-    val triggerPhysicalCapture: () -> Unit = {
-        vibrateFeedback()
-        val result = StorageEngine.generateQuickTestPhoto(
-            context = context,
-            baseRelativePath = baseDirectory,
-            albumName = activeFolder,
-            prefix = filePrefix
-        )
-        result.onSuccess { savedFile ->
-            lastCaptureLog = "GRAVADO NO DISCO: ${savedFile.absolutePath}"
-            storageRefreshTick++
-        }.onFailure { err ->
-            lastCaptureLog = "FALHA DE ESCRITA: ${err.message} (Verifique a permissão de pastas)"
+    // Se o usuario apertar Volume - estando fora da aba da camera, abre a Camera Pro imediatamente
+    LaunchedEffect(currentTab) {
+        if (currentTab != 1) {
+            registerVolumeTrigger {
+                vibrateFeedback()
+                currentTab = 1
+            }
         }
-    }
-
-    LaunchedEffect(filePrefix, activeFolder, baseDirectory) {
-        registerVolumeTrigger(triggerPhysicalCapture)
     }
 
     Scaffold(
@@ -315,7 +299,7 @@ fun CamFLCApp(
                             activeFolder = clean
                             prefs.edit().putString("active_folder", clean).apply()
                             vibrateFeedback()
-                            lastCaptureLog = "PASTA CRIADA NO DISCO: /storage/emulated/0/$baseDirectory/$clean"
+                            lastCaptureLog = "PASTA CRIADA: /storage/emulated/0/$baseDirectory/$clean"
                             storageRefreshTick++
                         }
                     },
@@ -329,7 +313,7 @@ fun CamFLCApp(
                             lastCaptureLog = "PASTA RENOMEADA PARA: $clean"
                             storageRefreshTick++
                         } else {
-                            lastCaptureLog = "Não foi possível renomear (verifique o nome ou permissão)."
+                            lastCaptureLog = "Não foi possível renomear a pasta."
                         }
                     },
                     onDeleteActiveFolder = {
@@ -354,20 +338,35 @@ fun CamFLCApp(
                     onLaunchNativeCamera = launchNativeCamera
                 )
 
-                1 -> CameraPreviewPlaceholderScreen(
+                1 -> ProCameraScreen(
+                    baseDirectory = baseDirectory,
                     activeFolder = activeFolder,
                     albumsList = albumsList,
                     filePrefix = filePrefix,
-                    lastCaptureLog = lastCaptureLog,
                     useNativeCameraFallback = useNativeCameraFallback,
+                    lastCaptureLog = lastCaptureLog,
+                    registerVolumeTrigger = registerVolumeTrigger,
                     onSelectFolder = { folder ->
                         activeFolder = folder
                         prefs.edit().putString("active_folder", folder).apply()
                         vibrateFeedback()
                         storageRefreshTick++
                     },
-                    onTriggerCapture = triggerPhysicalCapture,
-                    onLaunchNativeCamera = launchNativeCamera
+                    onCreateQuickFolder = { newName ->
+                        if (StorageEngine.createAlbum(baseDirectory, newName)) {
+                            val clean = StorageEngine.sanitizeFolderName(newName)
+                            activeFolder = clean
+                            prefs.edit().putString("active_folder", clean).apply()
+                            vibrateFeedback()
+                            storageRefreshTick++
+                        }
+                    },
+                    onPhotoSaved = { logMsg ->
+                        lastCaptureLog = logMsg
+                        storageRefreshTick++
+                    },
+                    onLaunchNativeCamera = launchNativeCamera,
+                    vibrateFeedback = vibrateFeedback
                 )
 
                 2 -> LanPlaceholderScreen(
@@ -416,7 +415,6 @@ fun HomeStorageScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Alerta de Permissoes de Hardware e Pastas (Exibido apenas se faltar liberar algo)
         if (!hasAllFilesAccess || !hasCameraPermission) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = SolarAmber),
@@ -435,7 +433,7 @@ fun HomeStorageScreen(
                         fontWeight = FontWeight.ExtraBold
                     )
                     Text(
-                        text = "Para criar, renomear pastas livremente no armazenamento interno e usar a câmera sem bloqueios do Android, toque em LIBERAR AGORA e depois em ATUALIZAR STATUS.",
+                        text = "Toque em 1. LIBERAR AGORA e depois em 2. ATUALIZAR para ativar todas as permissões.",
                         color = SolarBlack,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
@@ -460,7 +458,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // Cabecalho de Alto Contraste com Caminho Fisico Real
         Surface(
             color = SolarBlack,
             shape = RoundedCornerShape(12.dp),
@@ -468,20 +465,20 @@ fun HomeStorageScreen(
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    text = "CamFLC • MOTOR DE PASTAS ATIVO",
+                    text = "CamFLC • CONTROLE DE CAMPO",
                     color = SolarAmber,
                     fontSize = 19.sp,
                     fontWeight = FontWeight.ExtraBold
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Caminho Real: /storage/emulated/0/$baseDirectory/$activeFolder/",
+                    text = "Destino: /storage/emulated/0/$baseDirectory/$activeFolder/",
                     color = SolarWhite,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Padrão: ${cleanPrefix}_AAAAMMDD_HHMMSS.jpg • (${activeAlbumInfo?.fileCount ?: 0} arquivos | ${activeAlbumInfo?.formattedSize() ?: "0 B"})",
+                    text = "Padrão: ${cleanPrefix}_AAAAMMDD_HHMMSS.jpg • (${activeAlbumInfo?.fileCount ?: 0} arq | ${activeAlbumInfo?.formattedSize() ?: "0 B"})",
                     color = SolarGreen,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -489,7 +486,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // Botoes de Acao Rapida de Captura (Camera Pro + Camera Nativa Automatica)
         Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier.fillMaxWidth()
@@ -505,7 +501,7 @@ fun HomeStorageScreen(
             ) {
                 Icon(Icons.Default.CameraAlt, contentDescription = null)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("VISOR PRO", fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+                Text("ABRIR CÂMERA PRO", fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
             }
 
             if (useNativeCameraFallback) {
@@ -525,7 +521,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // 1. Alternancia Agil de Albuns Reais no Disco
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -597,7 +592,6 @@ fun HomeStorageScreen(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Criador rapido de nova pasta fisica
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -624,18 +618,10 @@ fun HomeStorageScreen(
                     }
                 }
 
-                // Ferramentas de Renomear / Excluir a Pasta Ativa
                 if (showManageFolderTools) {
                     Spacer(modifier = Modifier.height(12.dp))
                     Divider(color = SolarBlack, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "GERENCIAR PASTA ATIVA ('$activeFolder'):",
-                        color = SolarBlack,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.ExtraBold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -670,7 +656,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // 2. Prefixo Padrao e Selecao Rapida de Diretorio Raiz
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -696,12 +681,6 @@ fun HomeStorageScreen(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                Text(
-                    text = "Atalhos de Diretório Raiz no Celular:",
-                    color = SolarBlack,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
@@ -737,7 +716,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // 3. Log de Gravacao Fisica e Ultimos Arquivos da Pasta Ativa
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -749,7 +727,7 @@ fun HomeStorageScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "3. ARQUIVOS REAIS EM '$activeFolder' & GATILHO VOLUME -",
+                    text = "3. ÚLTIMOS ARQUIVOS EM '$activeFolder'",
                     color = SolarBlack,
                     fontSize = 15.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -761,7 +739,7 @@ fun HomeStorageScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "Exibir botão da Câmera Nativa do Sistema",
+                        text = "Exibir botão auxiliar da Câmera Nativa",
                         color = SolarBlack,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f)
@@ -786,164 +764,12 @@ fun HomeStorageScreen(
                     )
                 }
 
-                if (recentFiles.isNotEmpty()) {
+                recentFiles.forEach { file ->
                     Text(
-                        text = "Últimos arquivos gravados nesta pasta:",
-                        color = SolarBlack,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.ExtraBold
-                    )
-                    recentFiles.forEach { file ->
-                        Text(
-                            text = "✓ ${file.name} (${file.length() / 1024} KB)",
-                            color = SolarBlack,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                } else {
-                    Text(
-                        text = "Pasta vazia. Aperte 'Volume -' ou 'Câmera Nativa' para gravar o primeiro arquivo real!",
+                        text = "✓ ${file.name} (${file.length() / 1024} KB)",
                         color = SolarBlack,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun CameraPreviewPlaceholderScreen(
-    activeFolder: String,
-    albumsList: List<AlbumInfo>,
-    filePrefix: String,
-    lastCaptureLog: String,
-    useNativeCameraFallback: Boolean,
-    onSelectFolder: (String) -> Unit,
-    onTriggerCapture: () -> Unit,
-    onLaunchNativeCamera: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(SolarBlack)
-            .padding(16.dp),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = "PASTA ATIVA NO VISOR (TOQUE PARA ALTERNAR EM 1 SEGUNDO):",
-                color = SolarAmber,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.ExtraBold
-            )
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(albumsList) { album ->
-                    val isSelected = album.name == activeFolder
-                    Surface(
-                        color = if (isSelected) SolarAmber else Color(0xFF262626),
-                        border = BorderStroke(2.dp, SolarAmber),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier
-                            .height(48.dp)
-                            .clickable { onSelectFolder(album.name) }
-                    ) {
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier.padding(horizontal = 14.dp)
-                        ) {
-                            Text(
-                                text = "${album.name} (${album.fileCount})",
-                                color = if (isSelected) SolarBlack else SolarWhite,
-                                fontWeight = FontWeight.ExtraBold,
-                                fontSize = 14.sp
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        Surface(
-            color = Color(0xFF1A1A1A),
-            border = BorderStroke(2.dp, SolarAmber),
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(vertical = 12.dp)
-        ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center,
-                modifier = Modifier.padding(20.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Camera,
-                    contentDescription = null,
-                    tint = SolarAmber,
-                    modifier = Modifier.size(64.dp)
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = "MOTOR DE ARMAZENAMENTO FÍSICO CONECTADO",
-                    color = SolarWhite,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "Pressione 'VOLUME -' para gravar um JPEG real de teste na pasta '$activeFolder' ou acione a Câmera Nativa abaixo. No Marco 3 este quadro será o visor ótico CameraX Pro!",
-                    color = SolarAmber,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Text(
-                    text = lastCaptureLog,
-                    color = SolarGreen,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-            }
-        }
-
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                onClick = onTriggerCapture,
-                colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(62.dp)
-            ) {
-                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(28.dp))
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = "GRAVAR JPEG REAL (OU VOLUME -)",
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-            }
-
-            if (useNativeCameraFallback) {
-                OutlinedButton(
-                    onClick = onLaunchNativeCamera,
-                    border = BorderStroke(2.dp, SolarAmber),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = SolarAmber),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp)
-                ) {
-                    Icon(Icons.Default.PhotoCameraBack, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "ABRIR CÂMERA NATIVA DO APARELHO",
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.ExtraBold
                     )
                 }
             }
@@ -983,7 +809,7 @@ fun LanPlaceholderScreen(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "${albumsList.size} álbuns físicos prontos • $totalFiles arquivos indexados para rede",
+                    text = "${albumsList.size} álbuns físicos • $totalFiles fotos prontas para transferência LAN",
                     color = SolarGreen,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.ExtraBold
