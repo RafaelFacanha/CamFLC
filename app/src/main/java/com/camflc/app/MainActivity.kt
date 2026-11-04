@@ -101,11 +101,51 @@ fun CamFLCApp(
         mutableStateOf(prefs.getBoolean("use_native_fallback", true))
     }
 
+    // Configuracoes de Rede Local (LAN)
+    var deviceName by remember {
+        val defaultModel = Build.MODEL?.replace("|", "_") ?: "Android_CamFLC"
+        mutableStateOf(prefs.getString("lan_device_name", defaultModel) ?: defaultModel)
+    }
+    var allowRemoteDelete by remember {
+        mutableStateOf(prefs.getBoolean("lan_allow_delete", true))
+    }
+    var pairedPeers by remember {
+        val raw = prefs.getString("lan_paired_peers", "").orEmpty()
+        val list = raw.split(";").mapNotNull { entry ->
+            val p = entry.split("|")
+            if (p.size >= 2 && p[1].isNotBlank()) PeerDevice(name = p[0], ip = p[1], isPaired = true) else null
+        }
+        mutableStateOf(list)
+    }
+    var discoveredPeers by remember { mutableStateOf<List<PeerDevice>>(emptyList()) }
+
     var albumsList by remember { mutableStateOf<List<AlbumInfo>>(emptyList()) }
     var recentFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     var storageRefreshTick by remember { mutableIntStateOf(0) }
-    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida sem atraso.") }
+    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida e sincronização LAN.") }
     var currentTab by remember { mutableIntStateOf(0) }
+
+    // Instancia do Motor LAN Embarcado
+    val lanEngine = remember {
+        LanEngine(
+            context = context,
+            getBaseDirectory = { baseDirectory },
+            getDeviceName = { deviceName },
+            isRemoteDeleteAllowed = { allowRemoteDelete },
+            onStorageChanged = { storageRefreshTick++ }
+        )
+    }
+
+    // Inicia o servidor HTTP (porta 8080) e o radar UDP assim que o aplicativo abre
+    DisposableEffect(Unit) {
+        lanEngine.startServer { discovered ->
+            val updated = discoveredPeers.filterNot { it.ip == discovered.ip } + discovered
+            discoveredPeers = updated
+        }
+        onDispose {
+            lanEngine.stopServer()
+        }
+    }
 
     var hasAllFilesAccess by remember {
         mutableStateOf(
@@ -166,7 +206,6 @@ fun CamFLCApp(
         }
     }
 
-    // So recarrega pastas quando confirmado (nunca durante digitacao parcial!)
     LaunchedEffect(baseDirectory, activeFolder, storageRefreshTick) {
         val defaultFolders = listOf("Geral", "Inspecao", "Laudo_A", "Equipamentos")
         StorageEngine.ensureDefaultAlbumsIfEmpty(baseDirectory, defaultFolders)
@@ -385,9 +424,40 @@ fun CamFLCApp(
                     vibrateFeedback = vibrateFeedback
                 )
 
-                2 -> LanPlaceholderScreen(
-                    baseDirectory = baseDirectory,
-                    albumsList = albumsList
+                2 -> LanScreen(
+                    lanEngine = lanEngine,
+                    deviceName = deviceName,
+                    onDeviceNameChange = { newName ->
+                        val clean = newName.replace("|", "_").replace(";", "_")
+                        deviceName = clean
+                        prefs.edit().putString("lan_device_name", clean).apply()
+                    },
+                    allowRemoteDelete = allowRemoteDelete,
+                    onToggleRemoteDelete = { allowed ->
+                        allowRemoteDelete = allowed
+                        prefs.edit().putBoolean("lan_allow_delete", allowed).apply()
+                    },
+                    pairedPeers = pairedPeers,
+                    discoveredPeers = discoveredPeers,
+                    onSavePairedPeer = { peerName, peerIp ->
+                        val cleanName = peerName.replace("|", "_").replace(";", "_")
+                        val cleanIp = peerIp.trim()
+                        val updated = pairedPeers.filterNot { it.ip == cleanIp } +
+                                PeerDevice(name = cleanName, ip = cleanIp, isPaired = true)
+                        pairedPeers = updated
+                        val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
+                        prefs.edit().putString("lan_paired_peers", serialized).apply()
+                    },
+                    onRemovePairedPeer = { targetIp ->
+                        val updated = pairedPeers.filterNot { it.ip == targetIp }
+                        pairedPeers = updated
+                        val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
+                        prefs.edit().putString("lan_paired_peers", serialized).apply()
+                    },
+                    onTriggerRadarScan = {
+                        lanEngine.sendDiscoveryBroadcast()
+                    },
+                    vibrateFeedback = vibrateFeedback
                 )
             }
         }
@@ -419,7 +489,6 @@ fun HomeStorageScreen(
     onLaunchNativeCamera: () -> Unit
 ) {
     var newFolderName by remember { mutableStateOf("") }
-    // Variavel em buffer para NAO criar pastas enquanto o usuario digita letra por letra
     var draftBaseDir by remember(baseDirectory) { mutableStateOf(baseDirectory) }
     var renameFolderText by remember(activeFolder) { mutableStateOf(activeFolder.substringAfterLast("/")) }
     var showManageFolderTools by remember { mutableStateOf(false) }
@@ -471,7 +540,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // Cabecalho de Alto Contraste com Hierarquia Completa de Subpastas
         Surface(
             color = SolarBlack,
             shape = RoundedCornerShape(12.dp),
@@ -535,7 +603,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // 1. Gerenciador Agil de Pastas e Subpastas
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -563,7 +630,6 @@ fun HomeStorageScreen(
                     }
                 }
 
-                // Se estiver dentro de uma subpasta (ex: DESC/JF22JS35), mostra atalho para subir para a pasta pai
                 if (activeFolder.contains("/")) {
                     val parentFolder = activeFolder.substringBeforeLast("/")
                     OutlinedButton(
@@ -630,7 +696,6 @@ fun HomeStorageScreen(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Campo unico intuitivo para criar Pasta na Raiz ou Subpasta dentro da Pasta Ativa
                 OutlinedTextField(
                     value = newFolderName,
                     onValueChange = { newFolderName = it },
@@ -651,7 +716,6 @@ fun HomeStorageScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    // Cria como Subpasta dentro da pasta atualmente selecionada
                     Button(
                         onClick = {
                             if (newFolderName.isNotBlank()) {
@@ -675,7 +739,6 @@ fun HomeStorageScreen(
                         )
                     }
 
-                    // Cria diretamente na Raiz
                     Button(
                         onClick = {
                             if (newFolderName.isNotBlank()) {
@@ -700,7 +763,6 @@ fun HomeStorageScreen(
                     Divider(color = SolarBlack, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // Botao de Faxina em 1 Toque para apagar pastas vazias criadas por engano
                     Button(
                         onClick = onCleanGhostFolders,
                         colors = ButtonDefaults.buttonColors(containerColor = SolarGreen, contentColor = SolarBlack),
@@ -755,7 +817,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // 2. Prefixo Padrao e Diretorio Base Com Confirmacao Explicita
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -809,7 +870,6 @@ fun HomeStorageScreen(
                     }
                 }
 
-                // Campo com Botao APLICAR para nunca criar pastas parciais enquanto digita
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -836,7 +896,6 @@ fun HomeStorageScreen(
             }
         }
 
-        // 3. Ultimos Arquivos Reais na Pasta/Subpasta Ativa
         Card(
             colors = CardDefaults.cardColors(containerColor = SolarSurface),
             border = BorderStroke(2.dp, SolarBlack),
@@ -893,48 +952,6 @@ fun HomeStorageScreen(
                         fontWeight = FontWeight.Bold
                     )
                 }
-            }
-        }
-    }
-}
-
-@Composable
-fun LanPlaceholderScreen(
-    baseDirectory: String,
-    albumsList: List<AlbumInfo>
-) {
-    val totalFiles = albumsList.sumOf { it.fileCount }
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Surface(
-            color = SolarBlack,
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "COMPARTILHAMENTO LAN (CELULAR & PC)",
-                    color = SolarAmber,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = "Raiz: /storage/emulated/0/$baseDirectory",
-                    color = SolarWhite,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "${albumsList.size} pastas/subpastas • $totalFiles fotos prontas para rede",
-                    color = SolarGreen,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
             }
         }
     }
