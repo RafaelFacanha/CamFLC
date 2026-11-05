@@ -1,6 +1,8 @@
 package com.camflc.app
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,14 +17,16 @@ data class PeerDevice(
     val name: String,
     val ip: String,
     val port: Int = 8080,
-    val lastSeenMs: Long = System.currentTimeMillis(),
     val isPaired: Boolean = false
 )
 
 data class RemoteFileInfo(
+    val albumRelativePath: String,
     val name: String,
     val sizeBytes: Long
 ) {
+    val uniqueKey: String get() = "$albumRelativePath/$name"
+
     fun formattedSize(): String {
         val kb = sizeBytes / 1024.0
         val mb = kb / 1024.0
@@ -61,7 +65,7 @@ class LanEngine(
         if (isRunning) return
         isRunning = true
 
-        // 1. Inicia o Servidor HTTP e API REST na porta 8080
+        // 1. Inicia Servidor HTTP Multithread na porta 8080
         serverJob = engineScope.launch {
             try {
                 val socket = ServerSocket()
@@ -78,7 +82,7 @@ class LanEngine(
             }
         }
 
-        // 2. Escuta anuncios UDP de outros celulares CamFLC na mesma rede Wi-Fi/Hotspot
+        // 2. Escuta anuncios UDP de outros aparelhos CamFLC
         udpListenerJob = engineScope.launch {
             try {
                 val dSocket = DatagramSocket(null)
@@ -88,12 +92,12 @@ class LanEngine(
                 udpSocket = dSocket
 
                 val buffer = ByteArray(512)
-                val myIp = getLocalIpAddress()
 
                 while (isActive && isRunning) {
                     val packet = DatagramPacket(buffer, buffer.size)
                     dSocket.receive(packet)
                     val senderIp = packet.address.hostAddress ?: continue
+                    val myIp = getLocalIpAddress()
                     if (senderIp == myIp || senderIp == "127.0.0.1") continue
 
                     val msg = String(packet.data, 0, packet.length, Charsets.UTF_8)
@@ -118,11 +122,11 @@ class LanEngine(
             }
         }
 
-        // 3. Anuncia este aparelho na rede local a cada 3 segundos
+        // 3. Anuncia presenca na rede a cada 4 segundos
         udpBroadcasterJob = engineScope.launch {
             while (isActive && isRunning) {
                 sendDiscoveryBroadcast()
-                delay(3000)
+                delay(4000)
             }
         }
     }
@@ -134,7 +138,6 @@ class LanEngine(
                 val bytes = payload.toByteArray(Charsets.UTF_8)
                 DatagramSocket().use { sender ->
                     sender.broadcast = true
-                    // Envia para o broadcast global e tambem para o broadcast da sub-rede local
                     val targets = mutableSetOf("255.255.255.255")
                     val myIp = getLocalIpAddress()
                     if (myIp.count { it == '.' } == 3) {
@@ -157,14 +160,8 @@ class LanEngine(
 
     fun stopServer() {
         isRunning = false
-        try {
-            serverSocket?.close()
-        } catch (_: Exception) {
-        }
-        try {
-            udpSocket?.close()
-        } catch (_: Exception) {
-        }
+        runCatching { serverSocket?.close() }
+        runCatching { udpSocket?.close() }
         serverJob?.cancel()
         udpListenerJob?.cancel()
         udpBroadcasterJob?.cancel()
@@ -175,9 +172,15 @@ class LanEngine(
             try {
                 sock.soTimeout = 15000
                 val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
-                val out = sock.getOutputStream()
+                val out = BufferedOutputStream(sock.getOutputStream())
 
                 val requestLine = reader.readLine() ?: return
+                // DRENAGEM OBRIGATORIA DOS CABECALHOS HTTP (Evita Connection Reset no Android)
+                var headerLine = reader.readLine()
+                while (!headerLine.isNullOrEmpty()) {
+                    headerLine = reader.readLine()
+                }
+
                 val parts = requestLine.split(" ")
                 if (parts.size < 2) return
 
@@ -221,7 +224,7 @@ class LanEngine(
                         val albumRel = params["album"].orEmpty()
                         val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
                         val albumDir = File(rootDir, StorageEngine.sanitizeRelativePath(albumRel))
-                        val files = albumDir.listFiles { f -> f.isFile }
+                        val files = albumDir.listFiles { f -> isMediaFile(f) }
                             ?.sortedByDescending { it.lastModified() }
                             .orEmpty()
 
@@ -229,6 +232,7 @@ class LanEngine(
                         files.forEach { f ->
                             arr.put(
                                 JSONObject().apply {
+                                    put("album", albumRel)
                                     put("name", f.name)
                                     put("sizeBytes", f.length())
                                 }
@@ -239,6 +243,49 @@ class LanEngine(
                             put("files", arr)
                         }
                         sendTextResponse(out, "200 OK", "application/json; charset=utf-8", json.toString())
+                    }
+
+                    // Rota para o Modo Galeria Geral (Lista todas as fotos de todas as pastas)
+                    "/api/all_files" -> {
+                        val albums = StorageEngine.listAllAlbumsRecursively(baseDir)
+                        val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
+                        val arr = JSONArray()
+
+                        for (album in albums) {
+                            val albumDir = File(rootDir, StorageEngine.sanitizeRelativePath(album.relativePath))
+                            val files = albumDir.listFiles { f -> isMediaFile(f) }
+                                ?.sortedByDescending { it.lastModified() }
+                                .orEmpty()
+                            for (f in files) {
+                                arr.put(
+                                    JSONObject().apply {
+                                        put("album", album.relativePath)
+                                        put("name", f.name)
+                                        put("sizeBytes", f.length())
+                                    }
+                                )
+                            }
+                        }
+                        val json = JSONObject().apply {
+                            put("files", arr)
+                        }
+                        sendTextResponse(out, "200 OK", "application/json; charset=utf-8", json.toString())
+                    }
+
+                    // Gerador ultrarrapido de Miniaturas (Thumbnails ~25KB) para Galeria LAN e Web
+                    "/api/thumb" -> {
+                        val albumRel = params["album"].orEmpty()
+                        val fileName = params["name"].orEmpty()
+                        val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
+                        val targetFile = File(
+                            File(rootDir, StorageEngine.sanitizeRelativePath(albumRel)),
+                            StorageEngine.sanitizeSingleName(fileName)
+                        )
+                        if (targetFile.exists() && targetFile.isFile) {
+                            sendThumbnailResponse(out, targetFile)
+                        } else {
+                            sendTextResponse(out, "404 Not Found", "text/plain", "Miniatura nao encontrada")
+                        }
                     }
 
                     "/api/file" -> {
@@ -272,9 +319,17 @@ class LanEngine(
                         }
                     }
 
+                    // Baixa em .ZIP apenas as fotos selecionadas individualmente no PC
+                    "/api/zip_selected" -> {
+                        val itemsParam = params["items"].orEmpty()
+                        val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
+                        val selectedPairs = itemsParam.split("|").filter { it.contains("/") }
+                        sendSelectedZipStreamResponse(out, rootDir, selectedPairs)
+                    }
+
                     "/api/delete_file" -> {
                         if (!isRemoteDeleteAllowed()) {
-                            sendTextResponse(out, "403 Forbidden", "text/plain", "Exclusao remota bloqueada neste aparelho")
+                            sendTextResponse(out, "403 Forbidden", "text/plain", "Exclusao bloqueada")
                             return
                         }
                         val albumRel = params["album"].orEmpty()
@@ -285,11 +340,9 @@ class LanEngine(
                             StorageEngine.sanitizeSingleName(fileName)
                         )
                         val deleted = targetFile.exists() && targetFile.delete()
-                        if (deleted) {
-                            onStorageChanged()
-                        }
-                        val redirectWeb = params["web"] == "1"
-                        if (redirectWeb) {
+                        if (deleted) onStorageChanged()
+
+                        if (params["web"] == "1") {
                             val encodedAlbum = URLEncoder.encode(albumRel, "UTF-8")
                             sendRedirect(out, "/?album=$encodedAlbum")
                         } else {
@@ -299,14 +352,12 @@ class LanEngine(
 
                     "/api/delete_album" -> {
                         if (!isRemoteDeleteAllowed()) {
-                            sendTextResponse(out, "403 Forbidden", "text/plain", "Exclusao remota bloqueada neste aparelho")
+                            sendTextResponse(out, "403 Forbidden", "text/plain", "Exclusao bloqueada")
                             return
                         }
                         val albumRel = params["album"].orEmpty()
                         val deleted = StorageEngine.deleteAlbum(baseDir, albumRel)
-                        if (deleted) {
-                            onStorageChanged()
-                        }
+                        if (deleted) onStorageChanged()
                         sendTextResponse(out, "200 OK", "application/json", "{\"deleted\":$deleted}")
                     }
 
@@ -319,67 +370,132 @@ class LanEngine(
         }
     }
 
+    private fun isMediaFile(f: File): Boolean {
+        return f.isFile && (f.name.endsWith(".jpg", true) ||
+                f.name.endsWith(".jpeg", true) ||
+                f.name.endsWith(".png", true) ||
+                f.name.endsWith(".mp4", true))
+    }
+
+    // Painel Web para Computador com Modo Galeria de Miniaturas e Selecao Individual
     private fun buildPcWebPortalHtml(baseDir: String, selectedAlbum: String?): String {
         val albums = StorageEngine.listAllAlbumsRecursively(baseDir)
+        val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
+
+        // Se nenhuma pasta especifica foi clicada, exibe a Galeria Geral com todas as fotos
+        val galleryItems = mutableListOf<Pair<String, File>>()
+        if (selectedAlbum.isNullOrBlank()) {
+            for (alb in albums) {
+                val dir = File(rootDir, StorageEngine.sanitizeRelativePath(alb.relativePath))
+                dir.listFiles { f -> isMediaFile(f) }
+                    ?.sortedByDescending { it.lastModified() }
+                    ?.forEach { f -> galleryItems.add(alb.relativePath to f) }
+            }
+        } else {
+            val dir = File(rootDir, StorageEngine.sanitizeRelativePath(selectedAlbum))
+            dir.listFiles { f -> isMediaFile(f) }
+                ?.sortedByDescending { it.lastModified() }
+                ?.forEach { f -> galleryItems.add(selectedAlbum to f) }
+        }
+
         val sb = StringBuilder()
         sb.append("<!DOCTYPE html><html lang='pt-BR'><head><meta charset='utf-8'>")
         sb.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
-        sb.append("<title>CamFLC • Painel LAN (${getDeviceName()})</title>")
+        sb.append("<title>CamFLC • Galeria LAN (${getDeviceName()})</title>")
         sb.append("<style>")
         sb.append("body{font-family:sans-serif;background:#FFFFFF;color:#000000;margin:0;padding:20px;}")
         sb.append(".header{background:#000000;color:#FFD600;padding:18px;border-radius:12px;margin-bottom:20px;}")
         sb.append(".card{background:#F1F5F9;border:2px solid #000000;border-radius:12px;padding:16px;margin-bottom:16px;}")
-        sb.append(".btn{display:inline-block;background:#000000;color:#FFD600;padding:10px 16px;text-decoration:none;font-weight:bold;border-radius:8px;margin-right:8px;margin-top:6px;}")
+        sb.append(".btn{display:inline-block;background:#000000;color:#FFD600;padding:10px 14px;text-decoration:none;font-weight:bold;border-radius:8px;margin-right:8px;margin-top:6px;cursor:pointer;border:none;}")
         sb.append(".btn-amber{background:#FFD600;color:#000000;border:2px solid #000000;}")
-        sb.append(".btn-red{background:#D50000;color:#FFFFFF;}")
-        sb.append("table{width:100%;border-collapse:collapse;margin-top:12px;}")
-        sb.append("th,td{border-bottom:1px solid #000;padding:10px;text-align:left;font-weight:bold;}")
-        sb.append("</style></head><body>")
+        sb.append(".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-top:14px;}")
+        sb.append(".thumb-card{background:#FFFFFF;border:2px solid #000000;border-radius:10px;padding:8px;text-align:center;}")
+        sb.append(".thumb-card img{width:100%;height:140px;object-fit:cover;border-radius:6px;background:#000;}")
+        sb.append(".chk{transform:scale(1.6);margin-right:8px;cursor:pointer;}")
+        sb.append("</style>")
+        sb.append("<script>")
+        sb.append("function toggleAll(source){const c=document.querySelectorAll('.photo-chk');for(let i=0;i<c.length;i++){c[i].checked=source.checked;}}")
+        sb.append("function downloadSelected(){const c=document.querySelectorAll('.photo-chk:checked');if(c.length===0){alert('Selecione pelo menos 1 foto!');return;}const arr=[];c.forEach(x=>arr.push(x.value));window.location.href='/api/zip_selected?items='+encodeURIComponent(arr.join('|'));}")
+        sb.append("</script></head><body>")
 
         sb.append("<div class='header'>")
-        sb.append("<h2 style='margin:0;'>CamFLC • GERENCIADOR DE REDE LOCAL</h2>")
-        sb.append("<p style='color:#FFF;margin:6px 0 0 0;font-weight:bold;'>Dispositivo: ${getDeviceName()} | Raiz: /storage/emulated/0/$baseDir</p>")
+        sb.append("<h2 style='margin:0;'>CamFLC • GALERIA & REDE LOCAL (${getDeviceName()})</h2>")
+        sb.append("<a class='btn btn-amber' href='/'>🖼 GALERIA GERAL (TODAS AS FOTOS)</a>")
         sb.append("<a class='btn btn-amber' href='/api/zip?album='>⬇ BAIXAR TODAS AS PASTAS (.ZIP)</a>")
         sb.append("</div>")
 
-        sb.append("<div class='card'><h3>1. ÁLBUNS E SUBPASTAS NO DISPOSITIVO (${albums.size})</h3>")
+        sb.append("<div class='card'><h3>1. FILTRAR POR PASTA / SUBPASTA (${albums.size})</h3>")
         for (album in albums) {
             val enc = URLEncoder.encode(album.relativePath, "UTF-8")
-            sb.append("<div style='padding:10px;border-bottom:1px solid #ccc;'>")
-            sb.append("<span style='font-size:18px;font-weight:900;'>📁 ${album.relativePath}</span> ")
-            sb.append("<span>(${album.fileCount} arquivos • ${album.formattedSize()})</span><br>")
-            sb.append("<a class='btn' href='/?album=$enc'>VER ARQUIVOS</a>")
-            sb.append("<a class='btn btn-amber' href='/api/zip?album=$enc'>⬇ BAIXAR PASTA (.ZIP)</a>")
-            sb.append("</div>")
+            val activeStyle = if (album.relativePath == selectedAlbum) "border:3px solid #00C853;" else ""
+            sb.append("<a class='btn' style='$activeStyle' href='/?album=$enc'>📁 ${album.relativePath} (${album.fileCount})</a>")
         }
         sb.append("</div>")
 
-        if (!selectedAlbum.isNullOrBlank()) {
-            val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
-            val folder = File(rootDir, StorageEngine.sanitizeRelativePath(selectedAlbum))
-            val files = folder.listFiles { f -> f.isFile }?.sortedByDescending { it.lastModified() }.orEmpty()
-            val encAlbum = URLEncoder.encode(selectedAlbum, "UTF-8")
-
-            sb.append("<div class='card'>")
-            sb.append("<h3>2. ARQUIVOS EM '$selectedAlbum' (${files.size})</h3>")
-            sb.append("<table><tr><th>Arquivo</th><th>Tamanho</th><th>Ações</th></tr>")
-            for (f in files) {
-                val encFile = URLEncoder.encode(f.name, "UTF-8")
-                sb.append("<tr>")
-                sb.append("<td>${f.name}</td>")
-                sb.append("<td>${f.length() / 1024} KB</td>")
-                sb.append("<td>")
-                sb.append("<a class='btn' target='_blank' href='/api/file?album=$encAlbum&name=$encFile'>ABRIR / BAIXAR</a>")
-                if (isRemoteDeleteAllowed()) {
-                    sb.append("<a class='btn btn-red' href='/api/delete_file?album=$encAlbum&name=$encFile&web=1'>EXCLUIR</a>")
-                }
-                sb.append("</td></tr>")
-            }
-            sb.append("</table></div>")
+        val titleGallery = if (selectedAlbum.isNullOrBlank()) {
+            "2. MODO GALERIA GERAL (${galleryItems.size} fotos em todas as pastas)"
+        } else {
+            "2. GALERIA DA PASTA '$selectedAlbum' (${galleryItems.size} fotos)"
         }
 
-        sb.append("</body></html>")
+        sb.append("<div class='card'>")
+        sb.append("<h3>$titleGallery</h3>")
+        sb.append("<div>")
+        sb.append("<label style='font-weight:bold;font-size:16px;margin-right:16px;'><input type='checkbox' class='chk' onclick='toggleAll(this)'> SELECIONAR TODAS</label>")
+        sb.append("<button class='btn btn-amber' onclick='downloadSelected()'>⬇ BAIXAR FOTOS SELECIONADAS (.ZIP)</button>")
+        if (!selectedAlbum.isNullOrBlank()) {
+            val encAlb = URLEncoder.encode(selectedAlbum, "UTF-8")
+            sb.append("<a class='btn' href='/api/zip?album=$encAlb'>⬇ BAIXAR ESTA PASTA INTEIRA (.ZIP)</a>")
+        }
+        sb.append("</div>")
+
+        sb.append("<div class='grid'>")
+        for ((albPath, file) in galleryItems) {
+            val encAlb = URLEncoder.encode(albPath, "UTF-8")
+            val encFile = URLEncoder.encode(file.name, "UTF-8")
+            val itemValue = "$albPath/${file.name}"
+            sb.append("<div class='thumb-card'>")
+            sb.append("<a target='_blank' href='/api/file?album=$encAlb&name=$encFile'>")
+            sb.append("<img loading='lazy' src='/api/thumb?album=$encAlb&name=$encFile' alt='${file.name}'>")
+            sb.append("</a>")
+            sb.append("<div style='margin-top:8px;text-align:left;font-size:12px;font-weight:bold;word-break:break-all;'>")
+            sb.append("<label><input type='checkbox' class='chk photo-chk' value=\"$itemValue\"> ${file.name}</label>")
+            sb.append("<div style='color:#555;margin-top:4px;'>📁 $albPath (${file.length() / 1024} KB)</div>")
+            sb.append("</div></div>")
+        }
+        sb.append("</div></div></body></html>")
         return sb.toString()
+    }
+
+    private fun sendThumbnailResponse(out: OutputStream, file: File) {
+        try {
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, boundsOpts)
+            var sampleSize = 1
+            val maxDim = 320
+            while (boundsOpts.outWidth / sampleSize > maxDim || boundsOpts.outHeight / sampleSize > maxDim) {
+                sampleSize *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            val bmp = BitmapFactory.decodeFile(file.absolutePath, decodeOpts)
+            if (bmp != null) {
+                val baos = ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 72, baos)
+                bmp.recycle()
+                val bytes = baos.toByteArray()
+                val header = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: image/jpeg\r\n" +
+                        "Content-Length: ${bytes.size}\r\n" +
+                        "Cache-Control: max-age=3600\r\n" +
+                        "Connection: close\r\n\r\n"
+                out.write(header.toByteArray(Charsets.UTF_8))
+                out.write(bytes)
+                out.flush()
+                return
+            }
+        } catch (_: Exception) {
+        }
+        sendFileResponse(out, file)
     }
 
     private fun sendTextResponse(out: OutputStream, status: String, contentType: String, body: String) {
@@ -455,6 +571,35 @@ class LanEngine(
         }
     }
 
+    private fun sendSelectedZipStreamResponse(out: OutputStream, rootDir: File, selectedItems: List<String>) {
+        val header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/zip\r\n" +
+                "Content-Disposition: attachment; filename=\"CamFLC_Selecionadas.zip\"\r\n" +
+                "Connection: close\r\n\r\n"
+        out.write(header.toByteArray(Charsets.UTF_8))
+
+        ZipOutputStream(BufferedOutputStream(out)).use { zos ->
+            val buf = ByteArray(16 * 1024)
+            val addedEntries = mutableSetOf<String>()
+            for (relItem in selectedItems) {
+                val cleanRel = StorageEngine.sanitizeRelativePath(relItem)
+                if (cleanRel.isEmpty() || !addedEntries.add(cleanRel)) continue
+                val file = File(rootDir, cleanRel)
+                if (file.exists() && file.isFile) {
+                    zos.putNextEntry(ZipEntry(cleanRel))
+                    FileInputStream(file).use { fis ->
+                        var len: Int
+                        while (fis.read(buf).also { len = it } != -1) {
+                            zos.write(buf, 0, len)
+                        }
+                    }
+                    zos.closeEntry()
+                }
+            }
+            zos.flush()
+        }
+    }
+
     private fun parseQueryParams(query: String): Map<String, String> {
         if (query.isBlank()) return emptyMap()
         val map = mutableMapOf<String, String>()
@@ -467,7 +612,7 @@ class LanEngine(
     }
 
     // =========================================================================
-    // CLIENTE LAN: COMUNICACAO E SINCRONIZACAO ENTRE DISPOSITIVOS PAREADOS
+    // CLIENTE LAN: CONSULTA DE GALERIA, MINIATURAS E TRANSFERENCIA SELETIVA
     // =========================================================================
 
     suspend fun fetchRemoteDeviceInfo(peerIp: String, peerPort: Int = HTTP_PORT): Result<Pair<String, List<AlbumInfo>>> =
@@ -475,8 +620,8 @@ class LanEngine(
             try {
                 val url = URL("http://$peerIp:$peerPort/api/info")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 4000
-                    readTimeout = 6000
+                    connectTimeout = 5000
+                    readTimeout = 8000
                     requestMethod = "GET"
                 }
                 val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
@@ -503,17 +648,23 @@ class LanEngine(
             }
         }
 
-    suspend fun fetchRemoteAlbumFiles(
+    // Busca fotos de uma pasta especifica OU de todas as pastas (Modo Galeria Geral quando albumRelativePath == null)
+    suspend fun fetchRemoteGalleryFiles(
         peerIp: String,
         peerPort: Int = HTTP_PORT,
-        albumRelativePath: String
+        albumRelativePath: String?
     ): Result<List<RemoteFileInfo>> = withContext(Dispatchers.IO) {
         try {
-            val encAlbum = URLEncoder.encode(albumRelativePath, "UTF-8")
-            val url = URL("http://$peerIp:$peerPort/api/files?album=$encAlbum")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 4000
-                readTimeout = 6000
+            val endpoint = if (albumRelativePath == null) {
+                "http://$peerIp:$peerPort/api/all_files"
+            } else {
+                val encAlbum = URLEncoder.encode(albumRelativePath, "UTF-8")
+                "http://$peerIp:$peerPort/api/files?album=$encAlbum"
+            }
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 5000
+                readTimeout = 8000
+                requestMethod = "GET"
             }
             val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             val json = JSONObject(text)
@@ -523,6 +674,7 @@ class LanEngine(
                 val o = arr.getJSONObject(i)
                 files.add(
                     RemoteFileInfo(
+                        albumRelativePath = o.optString("album", albumRelativePath.orEmpty()),
                         name = o.optString("name"),
                         sizeBytes = o.optLong("sizeBytes", 0L)
                     )
@@ -534,35 +686,59 @@ class LanEngine(
         }
     }
 
-    // Copia ou Transfere (Move) uma pasta inteira do dispositivo remoto para este celular
-    suspend fun syncAlbumFromPeer(
+    // Baixa a miniatura leve (~25KB) de uma foto remota para exibir na grade do celular
+    suspend fun fetchRemoteThumbnailBitmap(
         peerIp: String,
         peerPort: Int = HTTP_PORT,
         albumRelativePath: String,
+        fileName: String
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            val encAlbum = URLEncoder.encode(albumRelativePath, "UTF-8")
+            val encName = URLEncoder.encode(fileName, "UTF-8")
+            val url = URL("http://$peerIp:$peerPort/api/thumb?album=$encAlbum&name=$encName")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 4000
+                readTimeout = 6000
+            }
+            conn.inputStream.use { input ->
+                val bytes = input.readBytes()
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // Copia ou Transfere (Move) uma lista de fotos selecionadas (ou de uma pasta inteira) mantendo as respectivas pastas
+    suspend fun syncSelectedFilesFromPeer(
+        peerIp: String,
+        peerPort: Int = HTTP_PORT,
+        selectedFiles: List<RemoteFileInfo>,
         deleteRemoteAfterTransfer: Boolean,
         onProgress: (String) -> Unit
     ): Result<Int> = withContext(Dispatchers.IO) {
         try {
-            val filesResult = fetchRemoteAlbumFiles(peerIp, peerPort, albumRelativePath)
-            val remoteFiles = filesResult.getOrElse { return@withContext Result.failure(it) }
-
             val localBase = getBaseDirectory()
             val localRoot = StorageEngine.resolveRootDir(localBase, createIfMissing = true)
-            val targetAlbumDir = File(localRoot, StorageEngine.sanitizeRelativePath(albumRelativePath))
-            if (!targetAlbumDir.exists()) targetAlbumDir.mkdirs()
-
             var copiedCount = 0
-            val encAlbum = URLEncoder.encode(albumRelativePath, "UTF-8")
 
-            for ((index, remoteFile) in remoteFiles.withIndex()) {
+            for ((index, remoteFile) in selectedFiles.withIndex()) {
                 withContext(Dispatchers.Main) {
-                    onProgress("Baixando (${index + 1}/${remoteFiles.size}): ${remoteFile.name}...")
+                    onProgress("Transferindo (${index + 1}/${selectedFiles.size}): ${remoteFile.name}...")
                 }
 
+                val targetAlbumDir = File(
+                    localRoot,
+                    StorageEngine.sanitizeRelativePath(remoteFile.albumRelativePath)
+                )
+                if (!targetAlbumDir.exists()) targetAlbumDir.mkdirs()
+
                 val localFile = File(targetAlbumDir, StorageEngine.sanitizeSingleName(remoteFile.name))
-                // Se o arquivo ja existe com o mesmo tamanho exato, nao baixa duplicado
+                val encAlbum = URLEncoder.encode(remoteFile.albumRelativePath, "UTF-8")
+                val encName = URLEncoder.encode(remoteFile.name, "UTF-8")
+
                 if (!localFile.exists() || localFile.length() != remoteFile.sizeBytes) {
-                    val encName = URLEncoder.encode(remoteFile.name, "UTF-8")
                     val fileUrl = URL("http://$peerIp:$peerPort/api/file?album=$encAlbum&name=$encName")
                     val conn = (fileUrl.openConnection() as HttpURLConnection).apply {
                         connectTimeout = 5000
@@ -582,20 +758,11 @@ class LanEngine(
                     copiedCount++
                 }
 
-                // Se for MODO TRANSFERENCIA (MOVER) e o arquivo local foi gravado com sucesso, apaga no remoto
                 if (deleteRemoteAfterTransfer && localFile.exists() && localFile.length() > 0) {
-                    val encName = URLEncoder.encode(remoteFile.name, "UTF-8")
                     val delUrl = URL("http://$peerIp:$peerPort/api/delete_file?album=$encAlbum&name=$encName")
                     runCatching {
                         (delUrl.openConnection() as HttpURLConnection).inputStream.close()
                     }
-                }
-            }
-
-            if (deleteRemoteAfterTransfer) {
-                val delAlbumUrl = URL("http://$peerIp:$peerPort/api/delete_album?album=$encAlbum")
-                runCatching {
-                    (delAlbumUrl.openConnection() as HttpURLConnection).inputStream.close()
                 }
             }
 
@@ -605,24 +772,6 @@ class LanEngine(
             Result.success(copiedCount)
         } catch (e: Exception) {
             Result.failure(e)
-        }
-    }
-
-    suspend fun deleteRemoteSingleFile(
-        peerIp: String,
-        peerPort: Int = HTTP_PORT,
-        albumRelativePath: String,
-        fileName: String
-    ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val encAlbum = URLEncoder.encode(albumRelativePath, "UTF-8")
-            val encName = URLEncoder.encode(fileName, "UTF-8")
-            val url = URL("http://$peerIp:$peerPort/api/delete_file?album=$encAlbum&name=$encName")
-            val text = (url.openConnection() as HttpURLConnection)
-                .inputStream.bufferedReader().use { it.readText() }
-            text.contains("\"deleted\":true")
-        } catch (_: Exception) {
-            false
         }
     }
 
