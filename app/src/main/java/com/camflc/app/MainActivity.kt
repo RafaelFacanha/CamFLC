@@ -101,7 +101,6 @@ fun CamFLCApp(
         mutableStateOf(prefs.getBoolean("use_native_fallback", true))
     }
 
-    // Configuracoes de Rede Local (LAN)
     var deviceName by remember {
         val defaultModel = Build.MODEL?.replace("|", "_") ?: "Android_CamFLC"
         mutableStateOf(prefs.getString("lan_device_name", defaultModel) ?: defaultModel)
@@ -125,7 +124,6 @@ fun CamFLCApp(
     var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida e sincronização LAN.") }
     var currentTab by remember { mutableIntStateOf(0) }
 
-    // Instancia do Motor LAN Embarcado
     val lanEngine = remember {
         LanEngine(
             context = context,
@@ -136,11 +134,14 @@ fun CamFLCApp(
         )
     }
 
-    // Inicia o servidor HTTP (porta 8080) e o radar UDP assim que o aplicativo abre
+    // TRAVA DE ESTABILIDADE: So atualiza a lista se entrar um IP inedito ou mudar de nome!
     DisposableEffect(Unit) {
         lanEngine.startServer { discovered ->
-            val updated = discoveredPeers.filterNot { it.ip == discovered.ip } + discovered
-            discoveredPeers = updated
+            val existing = discoveredPeers.find { it.ip == discovered.ip }
+            if (existing == null || existing.name != discovered.name) {
+                discoveredPeers = (discoveredPeers.filterNot { it.ip == discovered.ip } + discovered)
+                    .sortedBy { it.ip }
+            }
         }
         onDispose {
             lanEngine.stopServer()
@@ -264,7 +265,7 @@ fun CamFLCApp(
                     selected = currentTab == 2,
                     onClick = { currentTab = 2 },
                     icon = { Icon(Icons.Default.Wifi, contentDescription = null) },
-                    label = { Text("REDE LAN", fontWeight = FontWeight.ExtraBold) },
+                    label = { Text("REDE & GALERIA", fontWeight = FontWeight.ExtraBold) },
                     colors = NavigationBarItemDefaults.colors(
                         selectedIconColor = SolarBlack,
                         selectedTextColor = SolarAmber,
@@ -426,6 +427,8 @@ fun CamFLCApp(
 
                 2 -> LanScreen(
                     lanEngine = lanEngine,
+                    baseDirectory = baseDirectory,
+                    localAlbumsList = albumsList,
                     deviceName = deviceName,
                     onDeviceNameChange = { newName ->
                         val clean = newName.replace("|", "_").replace(";", "_")
@@ -442,8 +445,9 @@ fun CamFLCApp(
                     onSavePairedPeer = { peerName, peerIp ->
                         val cleanName = peerName.replace("|", "_").replace(";", "_")
                         val cleanIp = peerIp.trim()
-                        val updated = pairedPeers.filterNot { it.ip == cleanIp } +
-                                PeerDevice(name = cleanName, ip = cleanIp, isPaired = true)
+                        val updated = (pairedPeers.filterNot { it.ip == cleanIp } +
+                                PeerDevice(name = cleanName, ip = cleanIp, isPaired = true))
+                            .sortedBy { it.ip }
                         pairedPeers = updated
                         val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
                         prefs.edit().putString("lan_paired_peers", serialized).apply()
