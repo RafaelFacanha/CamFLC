@@ -48,7 +48,6 @@ fun GalleryScreen(
 ) {
     val context = LocalContext.current
 
-    // Paleta adaptativa (Modo Claro Solar vs Modo Escuro OLED)
     val bgColor = if (isDarkMode) Color(0xFF0B0F19) else SolarWhite
     val cardColor = if (isDarkMode) Color(0xFF1E293B) else SolarSurface
     val textColor = if (isDarkMode) SolarWhite else SolarBlack
@@ -56,17 +55,12 @@ fun GalleryScreen(
     val borderColor = if (isDarkMode) Color(0xFF475569) else SolarBlack
 
     var searchQuery by remember { mutableStateOf("") }
-    // null = Todas as pastas | String = Pasta especifica
     var selectedAlbumFilter by remember { mutableStateOf<String?>(null) }
     var refreshTick by remember { mutableIntStateOf(0) }
 
-    // Selecao multipla de ficheiros
     var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
-
-    // Item aberto em Tela Cheia (Inspecao / Zoom)
     var inspectedItem by remember { mutableStateOf<LocalMediaItem?>(null) }
 
-    // Dialogos de Gestao (Mover, Renomear Foto, Criar Pasta, Excluir)
     var showMoveDialog by remember { mutableStateOf(false) }
     var showRenameFileDialog by remember { mutableStateOf(false) }
     var renameTargetItem by remember { mutableStateOf<LocalMediaItem?>(null) }
@@ -79,7 +73,6 @@ fun GalleryScreen(
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
     var statusBanner by remember { mutableStateOf<String?>(null) }
 
-    // Carrega os itens filtrados por pasta e pela barra de pesquisa
     val galleryItems = remember(baseDirectory, albumsList, selectedAlbumFilter, searchQuery, refreshTick) {
         StorageEngine.queryLocalGallery(
             baseRelativePath = baseDirectory,
@@ -88,7 +81,6 @@ fun GalleryScreen(
         )
     }
 
-    // Se o utilizador veio do clique na miniatura da Camera Pro, abre a foto em destaque
     LaunchedEffect(initialFocusedFilePath, galleryItems) {
         if (!initialFocusedFilePath.isNullOrBlank()) {
             val found = galleryItems.find { it.uniquePath == initialFocusedFilePath }
@@ -103,7 +95,6 @@ fun GalleryScreen(
         galleryItems.filter { selectedPaths.contains(it.uniquePath) }
     }
 
-    // 1. MODAL DE VISUALIZACAO EM TELA CHEIA (QUANDO CLICA NA LUPA OU VEM DA CAMERA)
     inspectedItem?.let { item ->
         FullScreenPhotoDialog(
             item = item,
@@ -126,7 +117,6 @@ fun GalleryScreen(
         )
     }
 
-    // 2. DIALOGO PARA RENOMEAR FICHEIRO
     if (showRenameFileDialog && renameTargetItem != null) {
         AlertDialog(
             onDismissRequest = { showRenameFileDialog = false },
@@ -173,7 +163,6 @@ fun GalleryScreen(
         )
     }
 
-    // 3. DIALOGO PARA MOVER FOTOS ENTRE PASTAS / SUBPASTAS
     if (showMoveDialog) {
         AlertDialog(
             onDismissRequest = { showMoveDialog = false },
@@ -227,6 +216,245 @@ fun GalleryScreen(
                                         text = album.relativePath,
                                         color = textColor,
                                         fontWeight = FontWeight.ExtraBold,
+                                        fontSize = 14.sp
+                                    )
+                                    Text(
+                                        text = "${album.fileCount} arquivos",
+                                        color = subTextColor,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showMoveDialog = false }) {
+                    Text("FECHAR", color = textColor, fontWeight = FontWeight.ExtraBold)
+                }
+            }
+        )
+    }
+
+    if (showCreateFolderDialog) {
+        val baseParent = selectedAlbumFilter ?: activeFolder
+        AlertDialog(
+            onDismissRequest = { showCreateFolderDialog = false },
+            containerColor = cardColor,
+            title = {
+                Text("CRIAR PASTA / SUBPASTA", color = textColor, fontWeight = FontWeight.ExtraBold)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { createAsSubfolder = false },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (!createAsSubfolder) SolarAmber else bgColor,
+                                contentColor = if (!createAsSubfolder) SolarBlack else textColor
+                            ),
+                            border = BorderStroke(1.5.dp, borderColor),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Na Raiz", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = { createAsSubfolder = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (createAsSubfolder) SolarAmber else bgColor,
+                                contentColor = if (createAsSubfolder) SolarBlack else textColor
+                            ),
+                            border = BorderStroke(1.5.dp, borderColor),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Subpasta", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                        }
+                    }
+                    OutlinedTextField(
+                        value = newFolderInput,
+                        onValueChange = { newFolderInput = it },
+                        label = { Text("Nome da nova pasta", fontWeight = FontWeight.Bold) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (newFolderInput.isNotBlank()) {
+                            val targetRel = if (createAsSubfolder && baseParent.isNotBlank()) {
+                                "$baseParent/${newFolderInput.trim()}"
+                            } else {
+                                newFolderInput.trim()
+                            }
+                            val created = StorageEngine.createAlbum(baseDirectory, targetRel)
+                            if (created != null) {
+                                vibrateFeedback()
+                                selectedAlbumFilter = created
+                                onSelectActiveFolder(created)
+                                statusBanner = "✓ Pasta '$created' criada e selecionada!"
+                                newFolderInput = ""
+                                refreshTick++
+                                onStorageChanged()
+                            }
+                            showCreateFolderDialog = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack)
+                ) {
+                    Text("CRIAR", fontWeight = FontWeight.ExtraBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFolderDialog = false }) {
+                    Text("CANCELAR", color = textColor, fontWeight = FontWeight.Bold)
+                }
+            }
+        )
+    }
+
+    if (showDeleteConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmDialog = false },
+            containerColor = cardColor,
+            title = {
+                Text("EXCLUIR ARQUIVOS?", color = SolarRed, fontWeight = FontWeight.ExtraBold)
+            },
+            text = {
+                Text(
+                    text = "Deseja excluir permanentemente ${selectedItemsList.size} arquivo(s) selecionado(s)?",
+                    color = textColor,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val deleted = StorageEngine.deleteMediaFiles(selectedItemsList.map { it.file })
+                        vibrateFeedback()
+                        statusBanner = "🗑️ $deleted arquivo(s) excluído(s)."
+                        selectedPaths = emptySet()
+                        showDeleteConfirmDialog = false
+                        refreshTick++
+                        onStorageChanged()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = SolarRed, contentColor = SolarWhite)
+                ) {
+                    Text("EXCLUIR AGORA", fontWeight = FontWeight.ExtraBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                    Text("CANCELAR", color = textColor, fontWeight = FontWeight.Bold)
+                }
+            }
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(bgColor)
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column {
+                Text(
+                    text = "GALERIA LOCAL",
+                    color = textColor,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Text(
+                    text = "${galleryItems.size} fotos exibidas • ${selectedPaths.size} selecionadas",
+                    color = subTextColor,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Button(
+                onClick = { showCreateFolderDialog = true },
+                colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("+ PASTA", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+            }
+        }
+
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            placeholder = {
+                Text("Pesquisar por prefixo, código ou pasta...", color = subTextColor, fontWeight = FontWeight.Bold)
+            },
+            leadingIcon = {
+                Icon(Icons.Default.Search, contentDescription = null, tint = textColor)
+            },
+            trailingIcon = {
+                if (searchQuery.isNotEmpty()) {
+                    IconButton(onClick = { searchQuery = "" }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Limpar", tint = textColor)
+                    }
+                }
+            },
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            item {
+                val isAll = selectedAlbumFilter == null
+                Surface(
+                    color = if (isAll) SolarAmber else cardColor,
+                    border = BorderStroke(1.5.dp, if (isAll) SolarBlack else borderColor),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier
+                        .height(40.dp)
+                        .clickable {
+                            selectedAlbumFilter = null
+                            vibrateFeedback()
+                        }
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 14.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.GridView,
+                            contentDescription = null,
+                            tint = if (isAll) SolarBlack else textColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Todas (${albumsList.sumOf { it.fileCount }})",
+                            color = if (isAll) SolarBlack else textColor,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            }
+
+            items(albumsList) { album ->
+                val isSel = selectedAlbumFilter == album.relativePath
+                Surface(
+                    color = if (isSel) SolarAmber else cardColor,
+                    border = BorderStroke(1.5.dp, if (isSel) SolarBlack else borderC    fontWeight = FontWeight.ExtraBold,
                                         fontSize = 14.sp
                                     )
                                     Text(
