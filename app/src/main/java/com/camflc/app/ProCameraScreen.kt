@@ -88,7 +88,6 @@ fun ProCameraScreen(
     var showGrid by remember { mutableStateOf(true) }
     var showEvSlider by remember { mutableStateOf(false) }
 
-    // Dialogo rapido para criar pasta ou subpasta sem sair da camera
     var showQuickNewFolderDialog by remember { mutableStateOf(false) }
     var createAsSubfolder by remember { mutableStateOf(true) }
     var quickFolderText by remember { mutableStateOf("") }
@@ -104,16 +103,13 @@ fun ProCameraScreen(
     var evMax by remember { mutableIntStateOf(0) }
     var currentEvIndex by remember { mutableIntStateOf(0) }
 
-    // Estado do Circulo de Foco por Toque
     var focusTouchPoint by remember { mutableStateOf<Offset?>(null) }
     var focusIsLocked by remember { mutableStateOf(false) }
     var focusIndicatorText by remember { mutableStateOf("AF Contínuo") }
     var focusSessionId by remember { mutableIntStateOf(0) }
 
-    // Estagio do obturador: 0 = Pronto | 1 = Capturando | 2 = Salvo
     var shutterStage by remember { mutableIntStateOf(0) }
 
-    // Miniatura viva da ultima foto tirada
     var latestPhotoTick by remember { mutableIntStateOf(0) }
     val latestMediaItem = remember(baseDirectory, activeFolder, albumsList, latestPhotoTick) {
         StorageEngine.getLatestMediaFile(baseDirectory, activeFolder)
@@ -151,7 +147,6 @@ fun ProCameraScreen(
         }
     }
 
-    // Inicializa o motor CameraX em latencia minima e resolucao maxima do sensor
     LaunchedEffect(lensFacing) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
@@ -252,7 +247,6 @@ fun ProCameraScreen(
         }, ContextCompat.getMainExecutor(context))
     }
 
-    // Disparo sincronizado (Volume - ou Botao Central)
     val captureProPhoto: () -> Unit = {
         val captureUseCase = imageCaptureUseCase
         if (captureUseCase != null && shutterStage == 0) {
@@ -316,16 +310,28 @@ fun ProCameraScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = createAsSubfolder,
+                        Button(
                             onClick = { createAsSubfolder = true },
-                            label = { Text("Subpasta", fontWeight = FontWeight.Bold) }
-                        )
-                        FilterChip(
-                            selected = !createAsSubfolder,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (createAsSubfolder) SolarAmber else SolarSurface,
+                                contentColor = SolarBlack
+                            ),
+                            border = BorderStroke(1.5.dp, SolarBlack),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Subpasta", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                        }
+                        Button(
                             onClick = { createAsSubfolder = false },
-                            label = { Text("Na Raiz", fontWeight = FontWeight.Bold) }
-                        )
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (!createAsSubfolder) SolarAmber else SolarSurface,
+                                contentColor = SolarBlack
+                            ),
+                            border = BorderStroke(1.5.dp, SolarBlack),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Na Raiz", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                        }
                     }
                     OutlinedTextField(
                         value = quickFolderText,
@@ -362,7 +368,6 @@ fun ProCameraScreen(
             .fillMaxSize()
             .background(SolarBlack)
     ) {
-        // 1. BARRA SUPERIOR DE CONTROLES RAPIDOS E SELETOR DE PASTA
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -375,7 +380,6 @@ fun ProCameraScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                // Indicador do Sensor e Prefixo
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -402,9 +406,7 @@ fun ProCameraScreen(
                     )
                 }
 
-                // Icones rapidos de Flash, Lanterna, Exposicao EV, Grade e Lente
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    // Flash
                     IconButton(
                         onClick = {
                             flashMode = when (flashMode) {
@@ -429,7 +431,6 @@ fun ProCameraScreen(
                         )
                     }
 
-                    // Lanterna Continua (Torch)
                     IconButton(
                         onClick = {
                             torchEnabled = !torchEnabled
@@ -445,7 +446,6 @@ fun ProCameraScreen(
                         )
                     }
 
-                    // Controle de Exposicao (EV)
                     IconButton(
                         onClick = { showEvSlider = !showEvSlider },
                         modifier = Modifier.size(36.dp)
@@ -457,7 +457,6 @@ fun ProCameraScreen(
                         )
                     }
 
-                    // Grade 3x3
                     IconButton(
                         onClick = { showGrid = !showGrid },
                         modifier = Modifier.size(36.dp)
@@ -469,4 +468,4 @@ fun ProCameraScreen(
                         )
                     }
 
-                    // Alternar L
+                    IconButton
