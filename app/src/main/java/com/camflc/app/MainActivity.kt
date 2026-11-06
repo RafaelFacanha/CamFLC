@@ -17,6 +17,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -33,12 +34,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
+import java.util.Locale
 
+// Paleta Base de Alta Visibilidade
 val SolarWhite = Color(0xFFFFFFFF)
 val SolarSurface = Color(0xFFF1F5F9)
 val SolarBlack = Color(0xFF000000)
@@ -76,7 +80,7 @@ class MainActivity : ComponentActivity() {
 
     private fun vibrateShort() {
         val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-        vibrator?.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE))
+        vibrator?.vibrate(VibrationEffect.createOneShot(55, VibrationEffect.DEFAULT_AMPLITUDE))
     }
 }
 
@@ -88,19 +92,33 @@ fun CamFLCApp(
 ) {
     val context = LocalContext.current
 
+    // Estado do Tema Dual: false = Modo Sol Claro (Outdoor) | true = Modo Escuro OLED (Indoor/Noturno)
+    var isDarkMode by remember {
+        mutableStateOf(prefs.getBoolean("is_dark_mode", false))
+    }
+
+    // Tela separada de Configuracoes Casuais
+    var showCasualSettings by remember { mutableStateOf(false) }
+
+    // Configuracoes Operacionais
     var baseDirectory by remember {
         mutableStateOf(prefs.getString("base_dir", "DCIM/CamFLC") ?: "DCIM/CamFLC")
     }
     var filePrefix by remember {
         mutableStateOf(prefs.getString("file_prefix", "OBRA_01") ?: "OBRA_01")
     }
+    var recentPrefixes by remember {
+        val saved = prefs.getString("recent_prefixes", "OBRA_01,INSPECAO,LAUDO") ?: "OBRA_01"
+        mutableStateOf(saved.split(",").filter { it.isNotBlank() })
+    }
     var activeFolder by remember {
         mutableStateOf(prefs.getString("active_folder", "Geral") ?: "Geral")
     }
     var useNativeCameraFallback by remember {
-        mutableStateOf(prefs.getBoolean("use_native_fallback", true))
+        mutableStateOf(prefs.getBoolean("use_native_fallback", false))
     }
 
+    // Configuracoes LAN
     var deviceName by remember {
         val defaultModel = Build.MODEL?.replace("|", "_") ?: "Android_CamFLC"
         mutableStateOf(prefs.getString("lan_device_name", defaultModel) ?: defaultModel)
@@ -119,10 +137,22 @@ fun CamFLCApp(
     var discoveredPeers by remember { mutableStateOf<List<PeerDevice>>(emptyList()) }
 
     var albumsList by remember { mutableStateOf<List<AlbumInfo>>(emptyList()) }
-    var recentFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     var storageRefreshTick by remember { mutableIntStateOf(0) }
-    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida e sincronização LAN.") }
+    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida.") }
+
+    // 4 Abas Principais: 0 = Inicio | 1 = Camera Pro | 2 = Galeria Local | 3 = Rede LAN
     var currentTab by remember { mutableIntStateOf(0) }
+    var initialGalleryFilePath by remember { mutableStateOf<String?>(null) }
+
+    // Funcao auxiliar para salvar prefixo nos recentes
+    val savePrefixToHistory: (String) -> Unit = { prefix ->
+        val clean = StorageEngine.sanitizePrefix(prefix)
+        if (clean.isNotBlank()) {
+            val updated = (listOf(clean) + recentPrefixes.filterNot { it.equals(clean, ignoreCase = true) }).take(6)
+            recentPrefixes = updated
+            prefs.edit().putString("recent_prefixes", updated.joinToString(",")).apply()
+        }
+    }
 
     val lanEngine = remember {
         LanEngine(
@@ -134,7 +164,6 @@ fun CamFLCApp(
         )
     }
 
-    // TRAVA DE ESTABILIDADE: So atualiza a lista se entrar um IP inedito ou mudar de nome!
     DisposableEffect(Unit) {
         lanEngine.startServer { discovered ->
             val existing = discoveredPeers.find { it.ip == discovered.ip }
@@ -179,16 +208,17 @@ fun CamFLCApp(
         if (success && file != null && file.exists()) {
             StorageEngine.indexFileInGallery(context, file)
             vibrateFeedback()
-            lastCaptureLog = "FOTO NATIVA SALVA: ${file.name} (${file.length() / 1024} KB)"
+            savePrefixToHistory(filePrefix)
+            lastCaptureLog = "✓ ${file.name} (${file.length() / 1024} KB)"
             storageRefreshTick++
         } else {
             file?.delete()
-            lastCaptureLog = "Captura na câmera nativa cancelada."
         }
     }
 
     val launchNativeCamera: () -> Unit = {
         try {
+            savePrefixToHistory(filePrefix)
             val targetFile = StorageEngine.createTargetMediaFile(
                 baseRelativePath = baseDirectory,
                 albumRelativePath = activeFolder,
@@ -203,7 +233,7 @@ fun CamFLCApp(
             )
             nativeCameraLauncher.launch(uri)
         } catch (e: Exception) {
-            lastCaptureLog = "ERRO AO ABRIR CÂMERA NATIVA: ${e.message}"
+            lastCaptureLog = "Erro Câmera Nativa: ${e.message}"
         }
     }
 
@@ -216,47 +246,216 @@ fun CamFLCApp(
             activeFolder = loaded.first().relativePath
             prefs.edit().putString("active_folder", activeFolder).apply()
         }
-        recentFiles = StorageEngine.listRecentFilesInAlbum(baseDirectory, activeFolder)
     }
 
-    LaunchedEffect(currentTab) {
-        if (currentTab != 1) {
+    LaunchedEffect(currentTab, showCasualSettings) {
+        if (currentTab != 1 || showCasualSettings) {
             registerVolumeTrigger {
                 vibrateFeedback()
+                showCasualSettings = false
                 currentTab = 1
             }
         }
     }
 
+    val topBarBg = if (isDarkMode) Color(0xFF0B0F19) else SolarBlack
+
     Scaffold(
-        containerColor = SolarWhite,
+        containerColor = if (isDarkMode) Color(0xFF0B0F19) else SolarWhite,
+        topBar = {
+            // Barra Superior Compacta (Oculta apenas dentro da Camera Pro para dar mais espaco ao visor)
+            if (currentTab != 1 || showCasualSettings) {
+                Surface(
+                    color = topBarBg,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (showCasualSettings) {
+                                IconButton(
+                                    onClick = { showCasualSettings = false },
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Icon(Icons.Default.ArrowBack, contentDescription = "Voltar", tint = SolarAmber)
+                                }
+                            } else {
+                                Icon(Icons.Default.PhotoCamera, contentDescription = null, tint = SolarAmber)
+                            }
+                            Text(
+                                text = if (showCasualSettings) "CONFIGURAÇÕES CASUAIS" else "CamFLC",
+                                color = SolarAmber,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // Alternador Rapido de Tema: Sol Claro vs Escuro OLED
+                            OutlinedButton(
+                                onClick = {
+                                    isDarkMode = !isDarkMode
+                                    prefs.edit().putBoolean("is_dark_mode", isDarkMode).apply()
+                                    vibrateFeedback()
+                                },
+                                border = BorderStroke(1.dp, SolarAmber),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.height(34.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isDarkMode) Icons.Default.LightMode else Icons.Default.DarkMode,
+                                    contentDescription = "Alternar Tema",
+                                    tint = SolarAmber,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (isDarkMode) "MODO SOL" else "MODO ESCURO",
+                                    color = SolarAmber,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+
+                            // Botao para Abrir / Fechar as Configuracoes Casuais
+                            IconButton(
+                                onClick = {
+                                    showCasualSettings = !showCasualSettings
+                                    vibrateFeedback()
+                                },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (showCasualSettings) Icons.Default.Close else Icons.Default.Settings,
+                                    contentDescription = "Configurações",
+                                    tint = if (showCasualSettings) SolarGreen else SolarWhite
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
         bottomBar = {
-            NavigationBar(
-                containerColor = SolarBlack,
-                contentColor = SolarWhite
-            ) {
-                NavigationBarItem(
-                    selected = currentTab == 0,
-                    onClick = { currentTab = 0 },
-                    icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
-                    label = { Text("PASTAS & CONFIG", fontWeight = FontWeight.ExtraBold) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = SolarBlack,
-                        selectedTextColor = SolarAmber,
-                        indicatorColor = SolarAmber,
-                        unselectedIconColor = SolarWhite,
-                        unselectedTextColor = SolarWhite
+            if (!showCasualSettings) {
+                NavigationBar(
+                    containerColor = SolarBlack,
+                    contentColor = SolarWhite
+                ) {
+                    NavigationBarItem(
+                        selected = currentTab == 0,
+                        onClick = { currentTab = 0 },
+                        icon = { Icon(Icons.Default.FolderSpecial, contentDescription = null) },
+                        label = { Text("INÍCIO", fontWeight = FontWeight.ExtraBold, fontSize = 11.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = SolarBlack,
+                            selectedTextColor = SolarAmber,
+                            indicatorColor = SolarAmber,
+                            unselectedIconColor = SolarWhite,
+                            unselectedTextColor = SolarWhite
+                        )
                     )
-                )
-                NavigationBarItem(
-                    selected = currentTab == 1,
-                    onClick = { currentTab = 1 },
-                    icon = { Icon(Icons.Default.CameraAlt, contentDescription = null) },
-                    label = { Text("CÂMERA PRO", fontWeight = FontWeight.ExtraBold) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = SolarBlack,
-                        selectedTextColor = SolarAmber,
-                        indicatorColor = SolarAmber,
+                    NavigationBarItem(
+                        selected = currentTab == 1,
+                        onClick = {
+                            savePrefixToHistory(filePrefix)
+                            currentTab = 1
+                        },
+                        icon = { Icon(Icons.Default.CameraAlt, contentDescription = null) },
+                        label = { Text("CÂMERA", fontWeight = FontWeight.ExtraBold, fontSize = 11.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = SolarBlack,
+                            selectedTextColor = SolarAmber,
+                            indicatorColor = SolarAmber,
+                            unselectedIconColor = SolarWhite,
+                            unselectedTextColor = SolarWhite
+                        )
+                    )
+                    NavigationBarItem(
+                        selected = currentTab == 2,
+                        onClick = { currentTab = 2 },
+                        icon = { Icon(Icons.Default.PhotoLibrary, contentDescription = null) },
+                        label = { Text("GALERIA", fontWeight = FontWeight.ExtraBold, fontSize = 11.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = SolarBlack,
+                            selectedTextColor = SolarAmber,
+                            indicatorColor = SolarAmber,
+                            unselectedIconColor = SolarWhite,
+                            unselectedTextColor = SolarWhite
+                        )
+                    )
+                    NavigationBarItem(
+                        selected = currentTab == 3,
+                        onClick = { currentTab = 3 },
+                        icon = { Icon(Icons.Default.Wifi, contentDescription = null) },
+                        label = { Text("REDE LAN", fontWeight = FontWeight.ExtraBold, fontSize = 11.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = SolarBlack,
+                            selectedTextColor = SolarAmber,
+                            indicatorColor = SolarAmber,
+                            unselectedIconColor = SolarWhite,
+                            unselectedTextColor = SolarWhite
+                        )
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            if (showCasualSettings) {
+                // TELA 5: CONFIGURACOES CASUAIS (ISOLADA DA OPERACAO PRINCIPAL)
+                CasualSettingsScreen(
+                    isDarkMode = isDarkMode,
+                    onToggleDarkMode = {
+                        isDarkMode = it
+                        prefs.edit().putBoolean("is_dark_mode", it).apply()
+                    },
+                    baseDirectory = baseDirectory,
+                    onApplyBaseDir = { confirmedDir ->
+                        val cleaned = StorageEngine.sanitizeRelativePath(confirmedDir).ifEmpty { "DCIM/CamFLC" }
+                        baseDirectory = cleaned
+                        prefs.edit().putString("base_dir", cleaned).apply()
+                        vibrateFeedback()
+                        lastCaptureLog = "Diretório base aplicado: $cleaned"
+                        storageRefreshTick++
+                    },
+                    activeFolder = activeFolder,
+                    albumsCount = albumsList.size,
+                    onRenameActiveFolder = { newName ->
+                        val updatedRel = StorageEngine.renameAlbum(baseDirectory, activeFolder, newName)
+                        if (updatedRel != null) {
+                            activeFolder = updatedRel
+                            prefs.edit().putString("active_folder", updatedRel).apply()
+                            vibrateFeedback()
+                            lastCaptureLog = "Pasta renomeada para: $updatedRel"
+                            storageRefreshTick++
+                        }
+                    },
+                    onDeleteActiveFolder = {
+                        if (albumsList.size > 1) {
+                            if (StorageEngine.deleteAlbum(baseDirectory, activeFolder)) {
+                                vibrateFeedback()
+                                lastCaptureLog = "Pasta excluída: $activeFolder"
+                                storageRefreshTick++
+                            }
+                        }
+                    },
+   r,
                         unselectedIconColor = SolarWhite,
                         unselectedTextColor = SolarWhite
                     )
