@@ -1,14 +1,15 @@
 package com.camflc.app
 
-import android.graphics.BitmapFactory
+import android.net.Uri
 import android.util.LruCache
+import android.widget.MediaController
+import android.widget.VideoView
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,6 +30,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -40,7 +44,8 @@ fun GalleryScreen(
     albumsList: List<AlbumInfo>,
     activeFolder: String,
     initialFocusedFilePath: String?,
-    onClearInitialFocusedFile: () -> Unit,
+    initialFocusedFolder: String?,
+    onClearInitialFocus: () -> Unit,
     isDarkMode: Boolean,
     onSelectActiveFolder: (String) -> Unit,
     onStorageChanged: () -> Unit,
@@ -56,17 +61,20 @@ fun GalleryScreen(
     val borderColor = if (isDarkMode) Color(0xFF475569) else SolarBlack
 
     var searchQuery by remember { mutableStateOf("") }
-    // null = Todas as pastas | String = Pasta especifica
-    var selectedAlbumFilter by remember { mutableStateOf<String?>(null) }
+    // Inicia filtrando diretamente na PASTA ATIVA (e nao na geral!)
+    var selectedAlbumFilter by remember { mutableStateOf<String?>(activeFolder) }
+    var folderDropdownExpanded by remember { mutableStateOf(false) }
+    var folderDropdownSearch by remember { mutableStateOf("") }
+
     var refreshTick by remember { mutableIntStateOf(0) }
 
-    // Selecao multipla de ficheiros
+    // Selecao multipla de arquivos
     var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
 
-    // Item aberto em Tela Cheia (Inspecao / Zoom)
-    var inspectedItem by remember { mutableStateOf<LocalMediaItem?>(null) }
+    // Caminho do arquivo aberto em Tela Cheia (Permite navegar ◀ / ▶ pela lista atual)
+    var inspectedPath by remember { mutableStateOf<String?>(null) }
 
-    // Dialogos de Gestao (Mover, Renomear Foto, Criar Pasta, Excluir)
+    // Dialogos de Gerenciamento (Mover, Renomear, Criar Pasta, Excluir)
     var showMoveDialog by remember { mutableStateOf(false) }
     var showRenameFileDialog by remember { mutableStateOf(false) }
     var renameTargetItem by remember { mutableStateOf<LocalMediaItem?>(null) }
@@ -74,12 +82,25 @@ fun GalleryScreen(
 
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var newFolderInput by remember { mutableStateOf("") }
-    var createAsSubfolder by remember { mutableStateOf(false) }
+    var createAsSubfolder by remember { mutableStateOf(true) }
 
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
     var statusBanner by remember { mutableStateOf<String?>(null) }
 
-    // Carrega os itens filtrados por pasta e pela barra de pesquisa
+    // Sincroniza quando o usuario clica na miniatura dentro da Camera Pro
+    LaunchedEffect(initialFocusedFolder, initialFocusedFilePath) {
+        if (!initialFocusedFolder.isNullOrBlank()) {
+            selectedAlbumFilter = initialFocusedFolder
+        }
+        if (!initialFocusedFilePath.isNullOrBlank()) {
+            inspectedPath = initialFocusedFilePath
+        }
+        if (initialFocusedFolder != null || initialFocusedFilePath != null) {
+            onClearInitialFocus()
+        }
+    }
+
+    // Carrega os itens filtrados pela pasta selecionada e pela barra de pesquisa
     val galleryItems = remember(baseDirectory, albumsList, selectedAlbumFilter, searchQuery, refreshTick) {
         StorageEngine.queryLocalGallery(
             baseRelativePath = baseDirectory,
@@ -88,45 +109,66 @@ fun GalleryScreen(
         )
     }
 
-    // Se o utilizador veio do clique na miniatura da Camera Pro, abre a foto em destaque
-    LaunchedEffect(initialFocusedFilePath, galleryItems) {
-        if (!initialFocusedFilePath.isNullOrBlank()) {
-            val found = galleryItems.find { it.uniquePath == initialFocusedFilePath }
-            if (found != null) {
-                inspectedItem = found
-                onClearInitialFocusedFile()
-            }
-        }
-    }
-
     val selectedItemsList = remember(galleryItems, selectedPaths) {
         galleryItems.filter { selectedPaths.contains(it.uniquePath) }
     }
 
-    // 1. MODAL DE VISUALIZACAO EM TELA CHEIA (QUANDO CLICA NA LUPA OU VEM DA CAMERA)
-    inspectedItem?.let { item ->
-        FullScreenPhotoDialog(
-            item = item,
-            onDismiss = { inspectedItem = null },
+    // Indice e objeto atual em Tela Cheia
+    val currentInspectedIndex = remember(galleryItems, inspectedPath) {
+        if (inspectedPath == null) -1 else galleryItems.indexOfFirst { it.uniquePath == inspectedPath }
+    }
+    val inspectedItem = if (currentInspectedIndex in galleryItems.indices) {
+        galleryItems[currentInspectedIndex]
+    } else null
+
+    // 1. MODAL DE VISUALIZACAO EM TELA CHEIA COM NAVEGACAO (◀ / ▶), VIDEO E EDICAO DIRETA
+    if (inspectedItem != null) {
+        FullScreenMediaDialog(
+            item = inspectedItem,
+            currentIndex = currentInspectedIndex,
+            totalCount = galleryItems.size,
+            hasPrevious = currentInspectedIndex > 0,
+            hasNext = currentInspectedIndex < galleryItems.size - 1,
+            onPrevious = {
+                if (currentInspectedIndex > 0) {
+                    vibrateFeedback()
+                    inspectedPath = galleryItems[currentInspectedIndex - 1].uniquePath
+                }
+            },
+            onNext = {
+                if (currentInspectedIndex < galleryItems.size - 1) {
+                    vibrateFeedback()
+                    inspectedPath = galleryItems[currentInspectedIndex + 1].uniquePath
+                }
+            },
+            onDismiss = { inspectedPath = null },
             onRenameClick = {
-                renameTargetItem = item
-                renameFileInput = item.file.nameWithoutExtension
+                renameTargetItem = inspectedItem
+                renameFileInput = inspectedItem.file.nameWithoutExtension
                 showRenameFileDialog = true
             },
             onMoveClick = {
-                selectedPaths = setOf(item.uniquePath)
-                inspectedItem = null
+                selectedPaths = setOf(inspectedItem.uniquePath)
                 showMoveDialog = true
             },
             onDeleteClick = {
-                selectedPaths = setOf(item.uniquePath)
-                inspectedItem = null
-                showDeleteConfirmDialog = true
+                // Calcula a proxima foto para continuar em tela cheia apos excluir a atual
+                val nextNeighbor = galleryItems.getOrNull(currentInspectedIndex + 1)
+                    ?: galleryItems.getOrNull(currentInspectedIndex - 1)
+                val deleted = StorageEngine.deleteMediaFiles(listOf(inspectedItem.file))
+                if (deleted > 0) {
+                    vibrateFeedback()
+                    selectedPaths = selectedPaths - inspectedItem.uniquePath
+                    inspectedPath = nextNeighbor?.uniquePath
+                    statusBanner = "🗑️ '${inspectedItem.name}' excluído."
+                    refreshTick++
+                    onStorageChanged()
+                }
             }
         )
     }
 
-    // 2. DIALOGO PARA RENOMEAR FICHEIRO
+    // 2. DIALOGO PARA RENOMEAR ARQUIVO (FUNCIONA NA GRADE E EM TELA CHEIA)
     if (showRenameFileDialog && renameTargetItem != null) {
         AlertDialog(
             onDismissRequest = { showRenameFileDialog = false },
@@ -152,7 +194,9 @@ fun GalleryScreen(
                             vibrateFeedback()
                             statusBanner = "✓ Renomeado para ${updatedFile.name}"
                             selectedPaths = emptySet()
-                            inspectedItem = null
+                            if (inspectedPath == target.uniquePath) {
+                                inspectedPath = updatedFile.absolutePath
+                            }
                             refreshTick++
                             onStorageChanged()
                         } else {
@@ -173,7 +217,7 @@ fun GalleryScreen(
         )
     }
 
-    // 3. DIALOGO PARA MOVER FOTOS ENTRE PASTAS / SUBPASTAS
+    // 3. DIALOGO PARA MOVER ARQUIVOS ENTRE PASTAS / SUBPASTAS
     if (showMoveDialog) {
         AlertDialog(
             onDismissRequest = { showMoveDialog = false },
@@ -211,6 +255,7 @@ fun GalleryScreen(
                                     vibrateFeedback()
                                     statusBanner = "✓ $moved arquivo(s) movido(s) para '${album.relativePath}'!"
                                     selectedPaths = emptySet()
+                                    inspectedPath = null
                                     showMoveDialog = false
                                     refreshTick++
                                     onStorageChanged()
@@ -262,14 +307,14 @@ fun GalleryScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
-                            selected = !createAsSubfolder,
-                            onClick = { createAsSubfolder = false },
-                            label = { Text("Na Raiz", fontWeight = FontWeight.Bold) }
-                        )
-                        FilterChip(
                             selected = createAsSubfolder,
                             onClick = { createAsSubfolder = true },
                             label = { Text("Subpasta de '$baseParent'", fontWeight = FontWeight.Bold) }
+                        )
+                        FilterChip(
+                            selected = !createAsSubfolder,
+                            onClick = { createAsSubfolder = false },
+                            label = { Text("Na Raiz", fontWeight = FontWeight.Bold) }
                         )
                     }
                     OutlinedTextField(
@@ -316,7 +361,7 @@ fun GalleryScreen(
         )
     }
 
-    // 5. DIALOGO DE CONFIRMACAO DE EXCLUSAO
+    // 5. DIALOGO DE CONFIRMACAO DE EXCLUSAO EM LOTE
     if (showDeleteConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirmDialog = false },
@@ -377,7 +422,7 @@ fun GalleryScreen(
                     fontWeight = FontWeight.ExtraBold
                 )
                 Text(
-                    text = "${galleryItems.size} fotos exibidas • ${selectedPaths.size} selecionadas",
+                    text = "${galleryItems.size} itens na visão • ${selectedPaths.size} marcados",
                     color = subTextColor,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
@@ -396,12 +441,143 @@ fun GalleryScreen(
             }
         }
 
-        // BARRA DE PESQUISA INSTANTANEA (POR PREFIXO, NOME OU PASTA)
+        // SELETOR DE PASTA EM MODELO DE LISTA SUSPENSA (DROPDOWN)
+        Box(modifier = Modifier.fillMaxWidth()) {
+            val currentAlbumObj = albumsList.find { it.relativePath == selectedAlbumFilter }
+            val dropdownLabel = if (selectedAlbumFilter == null) {
+                "🌐 Todas as Pastas (${albumsList.sumOf { it.fileCount }} arq)"
+            } else {
+                "📂 Pasta: $selectedAlbumFilter (${currentAlbumObj?.fileCount ?: galleryItems.size} arq)"
+            }
+
+            Surface(
+                color = cardColor,
+                border = BorderStroke(2.dp, SolarAmber),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .clickable { folderDropdownExpanded = true }
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 14.dp)
+                ) {
+                    Text(
+                        text = dropdownLabel,
+                        color = textColor,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "Selecionar pasta",
+                        tint = SolarAmber
+                    )
+                }
+            }
+
+            DropdownMenu(
+                expanded = folderDropdownExpanded,
+                onDismissRequest = {
+                    folderDropdownExpanded = false
+                    folderDropdownSearch = ""
+                },
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .heightIn(max = 380.dp)
+                    .background(cardColor)
+            ) {
+                Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    OutlinedTextField(
+                        value = folderDropdownSearch,
+                        onValueChange = { folderDropdownSearch = it },
+                        placeholder = { Text("Filtrar pasta na lista...", color = subTextColor, fontSize = 12.sp) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                // Opcao para ver Todas as Pastas
+                DropdownMenuItem(
+                    text = {
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "🌐 Todas as Pastas",
+                                color = if (selectedAlbumFilter == null) SolarAmber else textColor,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = "${albumsList.sumOf { it.fileCount }} arq",
+                                color = SolarGreen,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    },
+                    onClick = {
+                        selectedAlbumFilter = null
+                        folderDropdownExpanded = false
+                        folderDropdownSearch = ""
+                        vibrateFeedback()
+                    }
+                )
+
+                val filteredAlbums = albumsList.filter {
+                    folderDropdownSearch.isBlank() ||
+                            it.relativePath.contains(folderDropdownSearch.trim(), ignoreCase = true)
+                }
+
+                filteredAlbums.forEach { album ->
+                    val isSel = selectedAlbumFilter == album.relativePath
+                    DropdownMenuItem(
+                        text = {
+                            Row(
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = if (album.relativePath.contains("/")) "↳ 📂 ${album.relativePath}" else "📁 ${album.relativePath}",
+                                    color = if (isSel) SolarAmber else textColor,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    fontSize = 13.sp
+                                )
+                                Text(
+                                    text = "${album.fileCount} arq • ${album.formattedSize()}",
+                                    color = subTextColor,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        },
+                        onClick = {
+                            selectedAlbumFilter = album.relativePath
+                            onSelectActiveFolder(album.relativePath)
+                            folderDropdownExpanded = false
+                            folderDropdownSearch = ""
+                            vibrateFeedback()
+                        }
+                    )
+                }
+            }
+        }
+
+        // BARRA DE PESQUISA INSTANTANEA POR NOME OU PREFIXO
         OutlinedTextField(
             value = searchQuery,
             onValueChange = { searchQuery = it },
             placeholder = {
-                Text("Pesquisar por prefixo, código ou pasta...", color = subTextColor, fontWeight = FontWeight.Bold)
+                Text("Pesquisar foto/vídeo por prefixo ou código...", color = subTextColor, fontWeight = FontWeight.Bold)
             },
             leadingIcon = {
                 Icon(Icons.Default.Search, contentDescription = null, tint = textColor)
@@ -417,81 +593,6 @@ fun GalleryScreen(
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth()
         )
-
-        // CARROSSEL DE FILTRO DE PASTAS E SUBPASTAS
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            item {
-                val isAll = selectedAlbumFilter == null
-                Surface(
-                    color = if (isAll) SolarAmber else cardColor,
-                    border = BorderStroke(1.5.dp, if (isAll) SolarBlack else borderColor),
-                    shape = RoundedCornerShape(20.dp),
-                    modifier = Modifier
-                        .height(40.dp)
-                        .clickable {
-                            selectedAlbumFilter = null
-                            vibrateFeedback()
-                        }
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 14.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.GridView,
-                            contentDescription = null,
-                            tint = if (isAll) SolarBlack else textColor,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Todas (${albumsList.sumOf { it.fileCount }})",
-                            color = if (isAll) SolarBlack else textColor,
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 13.sp
-                        )
-                    }
-                }
-            }
-
-            items(albumsList) { album ->
-                val isSel = selectedAlbumFilter == album.relativePath
-                Surface(
-                    color = if (isSel) SolarAmber else cardColor,
-                    border = BorderStroke(1.5.dp, if (isSel) SolarBlack else borderColor),
-                    shape = RoundedCornerShape(20.dp),
-                    modifier = Modifier
-                        .height(40.dp)
-                        .clickable {
-                            selectedAlbumFilter = album.relativePath
-                            vibrateFeedback()
-                        }
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 14.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (album.relativePath.contains("/")) {
-                                Icons.Default.SubdirectoryArrowRight
-                            } else {
-                                Icons.Default.Folder
-                            },
-                            contentDescription = null,
-                            tint = if (isSel) SolarBlack else SolarAmber,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "${album.relativePath} (${album.fileCount})",
-                            color = if (isSel) SolarBlack else textColor,
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 13.sp
-                        )
-                    }
-                }
-            }
-        }
 
         // BANNER DE FEEDBACK DE OPERACOES
         statusBanner?.let { msg ->
@@ -520,7 +621,7 @@ fun GalleryScreen(
             }
         }
 
-        // BARRA DE ACOES DE GESTAO (SELECAO E ACOES EM LOTE)
+        // BARRA DE ACOES DE GERENCIAMENTO EM LOTE
         Card(
             colors = CardDefaults.cardColors(containerColor = cardColor),
             border = BorderStroke(1.5.dp, borderColor),
@@ -564,23 +665,18 @@ fun GalleryScreen(
                         }
                     }
 
-                    // Se uma pasta especifica estiver filtrada, permite defini-la como ativa para a Camera
-                    selectedAlbumFilter?.let { filterFolder ->
-                        if (filterFolder != activeFolder) {
-                            TextButton(
-                                onClick = {
-                                    onSelectActiveFolder(filterFolder)
-                                    vibrateFeedback()
-                                    statusBanner = "✓ '$filterFolder' definida como pasta ativa da câmera!"
-                                }
-                            ) {
-                                Text("Usar na Câmera", color = SolarAmber, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                    if (selectedAlbumFilter != activeFolder) {
+                        TextButton(
+                            onClick = {
+                                selectedAlbumFilter = activeFolder
+                                vibrateFeedback()
                             }
+                        ) {
+                            Text("Ir p/ Pasta Ativa", color = SolarAmber, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                         }
                     }
                 }
 
-                // Botoes de Acao Direta: MOVER | RENOMEAR | EXCLUIR
                 if (selectedItemsList.isNotEmpty()) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -659,7 +755,7 @@ fun GalleryScreen(
                         text = if (searchQuery.isNotBlank()) {
                             "Nenhum arquivo encontrado para '$searchQuery'."
                         } else {
-                            "Nenhuma foto nesta pasta ainda."
+                            "Nenhuma foto ou vídeo nesta pasta ainda."
                         },
                         color = textColor,
                         fontWeight = FontWeight.Bold,
@@ -691,7 +787,7 @@ fun GalleryScreen(
                                 },
                                 onInspectFullScreen = {
                                     vibrateFeedback()
-                                    inspectedItem = mediaItem
+                                    inspectedPath = mediaItem.uniquePath
                                 },
                                 modifier = Modifier.weight(1f)
                             )
@@ -727,12 +823,7 @@ fun GalleryPhotoCard(
     val thumb by produceState<ImageBitmap?>(initialValue = galleryThumbCache.get(cacheKey), cacheKey) {
         if (value == null) {
             val decoded = withContext(Dispatchers.IO) {
-                try {
-                    val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
-                    BitmapFactory.decodeFile(item.file.absolutePath, opts)?.asImageBitmap()
-                } catch (_: Exception) {
-                    null
-                }
+                StorageEngine.loadMediaThumbnail(item.file, sampleSize = 4)?.asImageBitmap()
             }
             if (decoded != null) {
                 galleryThumbCache.put(cacheKey, decoded)
@@ -745,7 +836,7 @@ fun GalleryPhotoCard(
         color = cardBg,
         border = BorderStroke(if (isSelected) 3.dp else 1.5.dp, borderColor),
         shape = RoundedCornerShape(12.dp),
-        modifier = modifier.clickable { onToggleSelect() }
+        modifier = modifier.clickable { onInspectFullScreen() }
     ) {
         Column(modifier = Modifier.padding(8.dp)) {
             Box(
@@ -764,6 +855,24 @@ fun GalleryPhotoCard(
                     )
                 }
 
+                if (item.isVideo) {
+                    Surface(
+                        color = SolarRed.copy(alpha = 0.85f),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(6.dp)
+                    ) {
+                        Text(
+                            text = "🎬 VÍDEO",
+                            color = SolarWhite,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+
                 // Botao no canto superior esquerdo para Ampliar em Tela Cheia
                 Surface(
                     color = SolarBlack.copy(alpha = 0.75f),
@@ -776,8 +885,8 @@ fun GalleryPhotoCard(
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
-                            imageVector = Icons.Default.ZoomIn,
-                            contentDescription = "Ampliar",
+                            imageVector = if (item.isVideo) Icons.Default.PlayArrow else Icons.Default.ZoomIn,
+                            contentDescription = "Abrir em Tela Cheia",
                             tint = SolarAmber,
                             modifier = Modifier.size(20.dp)
                         )
@@ -792,6 +901,7 @@ fun GalleryPhotoCard(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(6.dp)
+                        .clickable { onToggleSelect() }
                 ) {
                     Icon(
                         imageVector = if (isSelected) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
@@ -826,56 +936,104 @@ fun GalleryPhotoCard(
 }
 
 @Composable
-fun FullScreenPhotoDialog(
+fun FullScreenMediaDialog(
     item: LocalMediaItem,
+    currentIndex: Int,
+    totalCount: Int,
+    hasPrevious: Boolean,
+    hasNext: Boolean,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
     onDismiss: () -> Unit,
     onRenameClick: () -> Unit,
     onMoveClick: () -> Unit,
     onDeleteClick: () -> Unit
 ) {
     val fullBitmap by produceState<ImageBitmap?>(initialValue = null, item.uniquePath) {
-        value = withContext(Dispatchers.IO) {
-            try {
-                val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
-                BitmapFactory.decodeFile(item.file.absolutePath, opts)?.asImageBitmap()
-            } catch (_: Exception) {
-                null
+        if (item.isVideo) {
+            value = null
+        } else {
+            value = withContext(Dispatchers.IO) {
+                StorageEngine.loadMediaThumbnail(item.file, sampleSize = 2)?.asImageBitmap()
             }
         }
     }
 
-    AlertDialog(
+    Dialog(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF0B0F19),
-        title = {
-            Column {
-                Text(
-                    text = item.name,
-                    color = SolarAmber,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-                Text(
-                    text = "📁 ${item.albumRelativePath} • ${item.formattedSize()} • ${item.formattedDate()}",
-                    color = SolarWhite,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        },
-        text = {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF0B0F19))
+                .padding(14.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            // 1. TOPO DA TELA CHEIA: Nome, Pasta, Posicao (Ex: 3 de 12) e Botao Fechar
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Box(
-                    contentAlignment = Alignment.Center,
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = item.name,
+                        color = SolarAmber,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "📂 ${item.albumRelativePath} • ${item.formattedSize()} • (${currentIndex + 1} de $totalCount)",
+                        color = SolarWhite,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                IconButton(
+                    onClick = onDismiss,
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .height(340.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(SolarBlack)
+                        .size(40.dp)
+                        .background(Color(0xFF1E293B), CircleShape)
+                        .border(1.5.dp, SolarAmber, CircleShape)
                 ) {
+                    Icon(Icons.Default.Close, contentDescription = "Fechar", tint = SolarAmber)
+                }
+            }
+
+            // 2. CENTRO: VISOR AMPLIADO DE FOTO OU REPRODUTOR DE VIDEO (.MP4) + SETAS LATERAIS (◀ / ▶)
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(vertical = 10.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(SolarBlack)
+                    .border(1.5.dp, Color(0xFF334155), RoundedCornerShape(14.dp))
+            ) {
+                if (item.isVideo) {
+                    key(item.uniquePath) {
+                        AndroidView(
+                            factory = { ctx ->
+                                VideoView(ctx).apply {
+                                    val mediaController = MediaController(ctx)
+                                    mediaController.setAnchorView(this)
+                                    setMediaController(mediaController)
+                                    setVideoURI(Uri.fromFile(item.file))
+                                    setOnPreparedListener { mp ->
+                                        mp.isLooping = false
+                                        start()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                } else {
                     if (fullBitmap != null) {
                         Image(
                             bitmap = fullBitmap!!,
@@ -888,49 +1046,131 @@ fun FullScreenPhotoDialog(
                     }
                 }
 
+                // Seta Flutuante Esquerda (◀ Anterior)
+                if (hasPrevious) {
+                    IconButton(
+                        onClick = onPrevious,
+                        modifier = Modifier
+                            .align(Alignment.CenterStart)
+                            .padding(start = 10.dp)
+                            .size(48.dp)
+                            .background(SolarBlack.copy(alpha = 0.75f), CircleShape)
+                            .border(2.dp, SolarAmber, CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ChevronLeft,
+                            contentDescription = "Foto Anterior",
+                            tint = SolarAmber,
+                            modifier = Modifier.size(32.dp)
+                        )
+                    }
+                }
+
+                // Seta Flutuante Direita (Próxima ▶)
+                if (hasNext) {
+                    IconButton(
+                        onClick = onNext,
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .padding(end = 10.dp)
+                            .size(48.dp)
+                            .background(SolarBlack.copy(alpha = 0.75f), CircleShape)
+                            .border(2.dp, SolarAmber, CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ChevronRight,
+                            contentDescription = "Próxima Foto",
+                            tint = SolarAmber,
+                            modifier = Modifier.size(32.dp)
+                        )
+                    }
+                }
+            }
+
+            // 3. RODAPE DA TELA CHEIA: BOTOES DE NAVEGACAO E EDICAO DIRETA (RENOMEAR, MOVER, EXCLUIR)
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Button(
+                        onClick = onPrevious,
+                        enabled = hasPrevious,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1E293B),
+                            contentColor = SolarAmber
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("ANTERIOR", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                    }
+
+                    Spacer(modifier = Modifier.width(10.dp))
+
+                    Button(
+                        onClick = onNext,
+                        enabled = hasNext,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1E293B),
+                            contentColor = SolarAmber
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("PRÓXIMA", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(Icons.Default.ArrowForward, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                }
+
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    OutlinedButton(
+                    Button(
                         onClick = onRenameClick,
-                        border = BorderStroke(1.dp, SolarAmber),
-                        modifier = Modifier.weight(1f)
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
                     ) {
-                        Icon(Icons.Default.Edit, contentDescription = null, tint = SolarAmber, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Renomear", color = SolarAmber, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("RENOMEAR", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                     }
 
-                    OutlinedButton(
+                    Button(
                         onClick = onMoveClick,
-                        border = BorderStroke(1.dp, SolarGreen),
-                        modifier = Modifier.weight(1f)
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarGreen, contentColor = SolarBlack),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
                     ) {
-                        Icon(Icons.Default.DriveFileMove, contentDescription = null, tint = SolarGreen, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.DriveFileMove, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Mover", color = SolarGreen, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("MOVER", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                     }
 
-                    OutlinedButton(
+                    Button(
                         onClick = onDeleteClick,
-                        border = BorderStroke(1.dp, SolarRed),
-                        modifier = Modifier.weight(1f)
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarRed, contentColor = SolarWhite),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
                     ) {
-                        Icon(Icons.Default.Delete, contentDescription = null, tint = SolarRed, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Excluir", color = SolarRed, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("EXCLUIR", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                     }
                 }
             }
-        },
-        confirmButton = {
-            Button(
-                onClick = onDismiss,
-                colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack)
-            ) {
-                Text("FECHAR", fontWeight = FontWeight.ExtraBold)
-            }
         }
-    )
+    }
 }
