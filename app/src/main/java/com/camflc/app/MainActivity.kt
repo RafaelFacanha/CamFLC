@@ -637,13 +637,13 @@ fun CamFLCApp(
                                     PeerDevice(name = cleanName, ip = cleanIp, isPaired = true))
                                 .sortedBy { it.ip }
                             pairedPeers = updated
-                            val serialized = updated.joinToString(";") { "${it.name}\vert{}${it.ip}" }
+                            val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
                             prefs.edit().putString("lan_paired_peers", serialized).apply()
                         },
                         onRemovePairedPeer = { targetIp ->
                             val updated = pairedPeers.filterNot { it.ip == targetIp }
                             pairedPeers = updated
-                            val serialized = updated.joinToString(";") { "${it.name}\vert{}${it.ip}" }
+                            val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
                             prefs.edit().putString("lan_paired_peers", serialized).apply()
                         },
                         onTriggerRadarScan = { lanEngine.sendDiscoveryBroadcast() },
@@ -1109,4 +1109,286 @@ fun CasualSettingsScreen(
     isDarkMode: Boolean,
     onToggleDarkMode: (Boolean) -> Unit,
     baseDirectory: String,
-    onApplyBaseDir
+    onApplyBaseDir: (String) -> Unit,
+    activeFolder: String,
+    albumsCount: Int,
+    onRenameActiveFolder: (String) -> Unit,
+    onDeleteActiveFolder: () -> Unit,
+    onCleanGhostFolders: () -> Unit,
+    useNativeCameraFallback: Boolean,
+    onToggleNativeCamera: (Boolean) -> Unit,
+    deviceName: String,
+    onDeviceNameChange: (String) -> Unit,
+    allowRemoteDelete: Boolean,
+    onToggleRemoteDelete: (Boolean) -> Unit,
+    hasAllFilesAccess: Boolean,
+    hasCameraPermission: Boolean,
+    onRequestPermissions: () -> Unit,
+    onRefreshPermissions: () -> Unit,
+    statusLog: String,
+    onCloseSettings: () -> Unit
+) {
+    val bgColor = if (isDarkMode) Color(0xFF0B0F19) else SolarWhite
+    val cardColor = if (isDarkMode) Color(0xFF1E293B) else SolarSurface
+    val textColor = if (isDarkMode) SolarWhite else SolarBlack
+    val borderColor = if (isDarkMode) Color(0xFF475569) else SolarBlack
+
+    var draftBaseDir by remember(baseDirectory) { mutableStateOf(baseDirectory) }
+    var renameFolderText by remember(activeFolder) { mutableStateOf(activeFolder.substringAfterLast("/")) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(bgColor)
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = cardColor),
+            border = BorderStroke(1.5.dp, borderColor),
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "1. APARÊNCIA E VISIBILIDADE",
+                    color = textColor,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Modo Escuro OLED (Ambientes internos/noite)",
+                        color = textColor,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(checked = isDarkMode, onCheckedChange = onToggleDarkMode)
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Exibir botão auxiliar da Câmera Nativa do Sistema",
+                        color = textColor,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(checked = useNativeCameraFallback, onCheckedChange = onToggleNativeCamera)
+                }
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = cardColor),
+            border = BorderStroke(1.5.dp, borderColor),
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "2. DIRETÓRIO BASE E MANUTENÇÃO DE PASTAS",
+                    color = textColor,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    listOf("DCIM/CamFLC", "Pictures/CamFLC", "Documents/CamFLC").forEach { preset ->
+                        val selected = baseDirectory == preset
+                        Surface(
+                            color = if (selected) SolarAmber else bgColor,
+                            border = BorderStroke(1.5.dp, if (selected) SolarBlack else borderColor),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    draftBaseDir = preset
+                                    onApplyBaseDir(preset)
+                                }
+                        ) {
+                            Text(
+                                text = preset.substringBefore("/"),
+                                color = if (selected) SolarBlack else textColor,
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(vertical = 10.dp, horizontal = 8.dp)
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = draftBaseDir,
+                        onValueChange = { draftBaseDir = it },
+                        label = { Text("Caminho Base Personalizado", fontWeight = FontWeight.Bold) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = { onApplyBaseDir(draftBaseDir) },
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+                        modifier = Modifier.height(54.dp)
+                    ) {
+                        Text("APLICAR", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+
+                Divider(color = borderColor, thickness = 1.dp)
+
+                Button(
+                    onClick = onCleanGhostFolders,
+                    colors = ButtonDefaults.buttonColors(containerColor = SolarGreen, contentColor = SolarBlack),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                ) {
+                    Icon(Icons.Default.CleaningServices, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("LIMPAR TODAS AS PASTAS VAZIAS (0 ARQ)", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = renameFolderText,
+                        onValueChange = { renameFolderText = it },
+                        label = { Text("Renomear pasta ativa ('$activeFolder')", fontWeight = FontWeight.Bold) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = { onRenameActiveFolder(renameFolderText) },
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarBlack, contentColor = SolarAmber),
+                        modifier = Modifier.height(54.dp)
+                    ) {
+                        Text("RENOMEAR", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                    }
+                }
+
+                if (albumsCount > 1) {
+                    OutlinedButton(
+                        onClick = onDeleteActiveFolder,
+                        border = BorderStroke(1.5.dp, SolarRed),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.DeleteForever, contentDescription = null, tint = SolarRed)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("EXCLUIR PASTA ATIVA '$activeFolder'", color = SolarRed, fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = cardColor),
+            border = BorderStroke(1.5.dp, borderColor),
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "3. REDE LAN E PERMISSÕES ANDROID",
+                    color = textColor,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+
+                OutlinedTextField(
+                    value = deviceName,
+                    onValueChange = onDeviceNameChange,
+                    label = { Text("Nome deste Dispositivo na Rede LAN", fontWeight = FontWeight.Bold) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Permitir que dispositivos na rede movam/excluam fotos daqui",
+                        color = textColor,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(checked = allowRemoteDelete, onCheckedChange = onToggleRemoteDelete)
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = onRequestPermissions,
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarBlack, contentColor = SolarAmber),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("PERMISSÕES ANDROID", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                    }
+                    OutlinedButton(
+                        onClick = onRefreshPermissions,
+                        border = BorderStroke(1.5.dp, borderColor)
+                    ) {
+                        Text("VERIFICAR", color = textColor, fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                    }
+                }
+
+                Surface(
+                    color = SolarBlack,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = statusLog,
+                        color = SolarGreen,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+        }
+
+        Button(
+            onClick = onCloseSettings,
+            colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp)
+        ) {
+            Icon(Icons.Default.Check, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("CONCLUIR E VOLTAR À OPERAÇÃO", fontWeight = FontWeight.ExtraBold)
+        }
+    }
+}
