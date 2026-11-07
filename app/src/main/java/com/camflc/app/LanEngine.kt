@@ -332,7 +332,7 @@ class LanEngine(
                             }
                         }
                         if (deletedCount > 0) {
-                            withContext(Dispatchers.Main) { onStorageChanged() }
+                            engineScope.launch(Dispatchers.Main) { onStorageChanged() }
                         }
                         val redirectAlbum = params["album"].orEmpty()
                         if (params["web"] == "1") {
@@ -357,7 +357,7 @@ class LanEngine(
                         )
                         val deleted = targetFile.exists() && targetFile.delete()
                         if (deleted) {
-                            withContext(Dispatchers.Main) { onStorageChanged() }
+                            engineScope.launch(Dispatchers.Main) { onStorageChanged() }
                         }
 
                         if (params["web"] == "1") {
@@ -376,7 +376,7 @@ class LanEngine(
                         val albumRel = params["album"].orEmpty()
                         val deleted = StorageEngine.deleteAlbum(baseDir, albumRel)
                         if (deleted) {
-                            withContext(Dispatchers.Main) { onStorageChanged() }
+                            engineScope.launch(Dispatchers.Main) { onStorageChanged() }
                         }
                         sendTextResponse(out, "200 OK", "application/json", "{\"deleted\":$deleted}")
                     }
