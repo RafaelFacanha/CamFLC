@@ -564,21 +564,19 @@ fun ProCameraScreen(
             val outputOptions = ImageCapture.OutputFileOptions.Builder(targetFile).build()
             savingInBackgroundCount++
 
+            // Feedback imediato no clique (latencia zero perceptivel)
+            shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+            vibrateFeedback()
+            shutterStage = 2 // LUZ VERDE IMEDIATA
+            coroutineScope.launch {
+                delay(220)
+                shutterStage = 0
+            }
+
             captureUseCase.takePicture(
                 outputOptions,
                 ioExecutor,
                 object : ImageCapture.OnImageSavedCallback {
-                    // Dispara no exato instante em que o obturador do sensor capta a luz (~0.10s a 0.18s)!
-                    override fun onCaptureStarted() {
-                        coroutineScope.launch(Dispatchers.Main) {
-                            shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-                            vibrateFeedback()
-                            shutterStage = 2 // LUZ VERDE IMEDIATA: ja pode mover o celular!
-                            delay(220)
-                            shutterStage = 0
-                        }
-                    }
-
                     override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                         StorageEngine.indexFileInGallery(context, targetFile)
                         val kb = targetFile.length() / 1024
@@ -600,6 +598,7 @@ fun ProCameraScreen(
             )
         }
     }
+
 
     // 2. GRAVACAO DE VIDEO PROFISSIONAL (.MP4 COM AUDIO E PAUSA/RETOMADA)
     val toggleVideoRecording: () -> Unit = {
