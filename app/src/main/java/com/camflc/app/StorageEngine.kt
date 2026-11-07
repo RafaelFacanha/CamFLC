@@ -1,6 +1,9 @@
 package com.camflc.app
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
 import android.os.Environment
 import java.io.File
@@ -30,6 +33,8 @@ data class LocalMediaItem(
 ) {
     val uniquePath: String get() = file.absolutePath
 
+    val isVideo: Boolean get() = StorageEngine.isVideoFile(file)
+
     fun formattedSize(): String = StorageEngine.formatBytes(sizeBytes)
 
     fun formattedDate(): String {
@@ -49,11 +54,46 @@ object StorageEngine {
         }
     }
 
+    fun isVideoFile(f: File): Boolean {
+        return f.isFile && f.name.endsWith(".mp4", ignoreCase = true)
+    }
+
     fun isMediaFile(f: File): Boolean {
         return f.isFile && (f.name.endsWith(".jpg", true) ||
                 f.name.endsWith(".jpeg", true) ||
                 f.name.endsWith(".png", true) ||
                 f.name.endsWith(".mp4", true))
+    }
+
+    // Extrai miniatura rapida tanto de fotos (.jpg/.png) quanto de videos (.mp4)
+    fun loadMediaThumbnail(file: File, sampleSize: Int = 4): Bitmap? {
+        if (!file.exists() || !file.isFile) return null
+        return if (isVideoFile(file)) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(file.absolutePath)
+                val frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.frameAtTime
+                if (frame != null && frame.width > 480) {
+                    val ratio = 480f / frame.width.toFloat()
+                    val targetH = (frame.height * ratio).toInt().coerceAtLeast(1)
+                    Bitmap.createScaledBitmap(frame, 480, targetH, true)
+                } else {
+                    frame
+                }
+            } catch (_: Exception) {
+                null
+            } finally {
+                runCatching { retriever.release() }
+            }
+        } else {
+            try {
+                val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                BitmapFactory.decodeFile(file.absolutePath, opts)
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     // Resolve o diretorio base sem criar pastas acidentais durante digitacao
@@ -116,7 +156,7 @@ object StorageEngine {
         return result
     }
 
-    // Busca e filtra fotos na Galeria Local (por pasta/subpasta e por termo de pesquisa)
+    // Busca e filtra fotos/videos na Galeria Local (por pasta/subpasta e por termo de pesquisa)
     fun queryLocalGallery(
         baseRelativePath: String,
         albumFilter: String? = null,
@@ -160,7 +200,7 @@ object StorageEngine {
         return items.sortedByDescending { it.lastModified }
     }
 
-    // Obtem a foto mais recente (da pasta ativa ou geral) para exibir na Miniatura da Camera Pro
+    // Obtem a foto/video mais recente da pasta ativa (ou geral se a pasta ativa estiver vazia)
     fun getLatestMediaFile(baseRelativePath: String, activeFolder: String? = null): LocalMediaItem? {
         if (!activeFolder.isNullOrBlank()) {
             val activeItems = queryLocalGallery(baseRelativePath, albumFilter = activeFolder)
@@ -215,7 +255,7 @@ object StorageEngine {
         return target.deleteRecursively()
     }
 
-    // Renomeia um arquivo individual dentro da Galeria Local (mantendo a extensao original)
+    // Renomeia um arquivo individual (foto ou video) mantendo a extensao original
     fun renameMediaFile(context: Context, sourceFile: File, newBaseName: String): File? {
         if (!sourceFile.exists()) return null
         val ext = sourceFile.extension.ifEmpty { "jpg" }
@@ -256,7 +296,6 @@ object StorageEngine {
             val moved = if (src.renameTo(finalDest)) {
                 true
             } else {
-                // Fallback por copia de stream caso rename falhe
                 try {
                     FileInputStream(src).use { input ->
                         FileOutputStream(finalDest).use { output ->
@@ -320,7 +359,7 @@ object StorageEngine {
         return removedCount
     }
 
-    // Cria o arquivo final com Prefixo + DataHora
+    // Cria o arquivo final (Foto .jpg ou Video .mp4) com Prefixo + DataHora
     fun createTargetMediaFile(
         baseRelativePath: String,
         albumRelativePath: String,
@@ -341,10 +380,15 @@ object StorageEngine {
     }
 
     fun indexFileInGallery(context: Context, file: File) {
+        val mime = when {
+            file.name.endsWith(".mp4", true) -> "video/mp4"
+            file.name.endsWith(".png", true) -> "image/png"
+            else -> "image/jpeg"
+        }
         MediaScannerConnection.scanFile(
             context,
             arrayOf(file.absolutePath),
-            arrayOf("image/jpeg")
+            arrayOf(mime)
         ) { _, _ -> }
     }
 
