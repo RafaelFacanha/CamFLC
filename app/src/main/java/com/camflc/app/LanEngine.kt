@@ -27,15 +27,7 @@ data class RemoteFileInfo(
 ) {
     val uniqueKey: String get() = "$albumRelativePath/$name"
 
-    fun formattedSize(): String {
-        val kb = sizeBytes / 1024.0
-        val mb = kb / 1024.0
-        return when {
-            mb >= 1.0 -> String.format(Locale.US, "%.2f MB", mb)
-            kb >= 1.0 -> String.format(Locale.US, "%.0f KB", kb)
-            else -> "$sizeBytes B"
-        }
-    }
+    fun formattedSize(): String = StorageEngine.formatBytes(sizeBytes)
 }
 
 class LanEngine(
@@ -65,7 +57,7 @@ class LanEngine(
         if (isRunning) return
         isRunning = true
 
-        // 1. Inicia Servidor HTTP Multithread na porta 8080
+        // 1. Servidor HTTP Multithread na porta 8080
         serverJob = engineScope.launch {
             try {
                 val socket = ServerSocket()
@@ -82,7 +74,7 @@ class LanEngine(
             }
         }
 
-        // 2. Escuta anuncios UDP de outros aparelhos CamFLC
+        // 2. Radar UDP para descobrir outros dispositivos CamFLC na mesma rede
         udpListenerJob = engineScope.launch {
             try {
                 val dSocket = DatagramSocket(null)
@@ -122,7 +114,7 @@ class LanEngine(
             }
         }
 
-        // 3. Anuncia presenca na rede a cada 4 segundos
+        // 3. Emissor automatico de presenca na rede a cada 4 segundos
         udpBroadcasterJob = engineScope.launch {
             while (isActive && isRunning) {
                 sendDiscoveryBroadcast()
@@ -175,7 +167,6 @@ class LanEngine(
                 val out = BufferedOutputStream(sock.getOutputStream())
 
                 val requestLine = reader.readLine() ?: return
-                // DRENAGEM OBRIGATORIA DOS CABECALHOS HTTP (Evita Connection Reset no Android)
                 var headerLine = reader.readLine()
                 while (!headerLine.isNullOrEmpty()) {
                     headerLine = reader.readLine()
@@ -224,7 +215,7 @@ class LanEngine(
                         val albumRel = params["album"].orEmpty()
                         val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
                         val albumDir = File(rootDir, StorageEngine.sanitizeRelativePath(albumRel))
-                        val files = albumDir.listFiles { f -> isMediaFile(f) }
+                        val files = albumDir.listFiles { f -> StorageEngine.isMediaFile(f) }
                             ?.sortedByDescending { it.lastModified() }
                             .orEmpty()
 
@@ -245,7 +236,6 @@ class LanEngine(
                         sendTextResponse(out, "200 OK", "application/json; charset=utf-8", json.toString())
                     }
 
-                    // Rota para o Modo Galeria Geral (Lista todas as fotos de todas as pastas)
                     "/api/all_files" -> {
                         val albums = StorageEngine.listAllAlbumsRecursively(baseDir)
                         val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
@@ -253,7 +243,7 @@ class LanEngine(
 
                         for (album in albums) {
                             val albumDir = File(rootDir, StorageEngine.sanitizeRelativePath(album.relativePath))
-                            val files = albumDir.listFiles { f -> isMediaFile(f) }
+                            val files = albumDir.listFiles { f -> StorageEngine.isMediaFile(f) }
                                 ?.sortedByDescending { it.lastModified() }
                                 .orEmpty()
                             for (f in files) {
@@ -272,7 +262,6 @@ class LanEngine(
                         sendTextResponse(out, "200 OK", "application/json; charset=utf-8", json.toString())
                     }
 
-                    // Gerador ultrarrapido de Miniaturas (Thumbnails ~25KB) para Galeria LAN e Web
                     "/api/thumb" -> {
                         val albumRel = params["album"].orEmpty()
                         val fileName = params["name"].orEmpty()
@@ -312,19 +301,46 @@ class LanEngine(
                             File(rootDir, StorageEngine.sanitizeRelativePath(albumRel))
                         }
                         if (targetDir.exists() && targetDir.isDirectory) {
-                            val zipName = (albumRel.replace("/", "_").ifEmpty { "CamFLC_Todos" }) + ".zip"
+                            val zipName = (albumRel.replace("/", "_").ifEmpty { "CamFLC_Completo" }) + ".zip"
                             sendZipStreamResponse(out, targetDir, zipName)
                         } else {
                             sendTextResponse(out, "404 Not Found", "text/plain", "Pasta nao encontrada")
                         }
                     }
 
-                    // Baixa em .ZIP apenas as fotos selecionadas individualmente no PC
                     "/api/zip_selected" -> {
                         val itemsParam = params["items"].orEmpty()
                         val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
                         val selectedPairs = itemsParam.split("|").filter { it.contains("/") }
                         sendSelectedZipStreamResponse(out, rootDir, selectedPairs)
+                    }
+
+                    "/api/delete_selected" -> {
+                        if (!isRemoteDeleteAllowed()) {
+                            sendTextResponse(out, "403 Forbidden", "text/plain", "Exclusao bloqueada neste aparelho")
+                            return
+                        }
+                        val itemsParam = params["items"].orEmpty()
+                        val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
+                        val selectedPairs = itemsParam.split("|").filter { it.contains("/") }
+                        var deletedCount = 0
+                        for (relItem in selectedPairs) {
+                            val cleanRel = StorageEngine.sanitizeRelativePath(relItem)
+                            val target = File(rootDir, cleanRel)
+                            if (target.exists() && target.isFile && target.delete()) {
+                                deletedCount++
+                            }
+                        }
+                        if (deletedCount > 0) {
+                            withContext(Dispatchers.Main) { onStorageChanged() }
+                        }
+                        val redirectAlbum = params["album"].orEmpty()
+                        if (params["web"] == "1") {
+                            val enc = URLEncoder.encode(redirectAlbum, "UTF-8")
+                            sendRedirect(out, if (redirectAlbum.isEmpty()) "/" else "/?album=$enc")
+                        } else {
+                            sendTextResponse(out, "200 OK", "application/json", "{\"deletedCount\":$deletedCount}")
+                        }
                     }
 
                     "/api/delete_file" -> {
@@ -340,11 +356,13 @@ class LanEngine(
                             StorageEngine.sanitizeSingleName(fileName)
                         )
                         val deleted = targetFile.exists() && targetFile.delete()
-                        if (deleted) onStorageChanged()
+                        if (deleted) {
+                            withContext(Dispatchers.Main) { onStorageChanged() }
+                        }
 
                         if (params["web"] == "1") {
                             val encodedAlbum = URLEncoder.encode(albumRel, "UTF-8")
-                            sendRedirect(out, "/?album=$encodedAlbum")
+                            sendRedirect(out, if (albumRel.isEmpty()) "/" else "/?album=$encodedAlbum")
                         } else {
                             sendTextResponse(out, "200 OK", "application/json", "{\"deleted\":$deleted}")
                         }
@@ -357,7 +375,9 @@ class LanEngine(
                         }
                         val albumRel = params["album"].orEmpty()
                         val deleted = StorageEngine.deleteAlbum(baseDir, albumRel)
-                        if (deleted) onStorageChanged()
+                        if (deleted) {
+                            withContext(Dispatchers.Main) { onStorageChanged() }
+                        }
                         sendTextResponse(out, "200 OK", "application/json", "{\"deleted\":$deleted}")
                     }
 
@@ -370,100 +390,159 @@ class LanEngine(
         }
     }
 
-    private fun isMediaFile(f: File): Boolean {
-        return f.isFile && (f.name.endsWith(".jpg", true) ||
-                f.name.endsWith(".jpeg", true) ||
-                f.name.endsWith(".png", true) ||
-                f.name.endsWith(".mp4", true))
-    }
-
-    // Painel Web para Computador com Modo Galeria de Miniaturas e Selecao Individual
+    // Portal Web LAN Modernizado: Tema Claro/Escuro, Pesquisa Instantanea, Filtro e Lightbox
     private fun buildPcWebPortalHtml(baseDir: String, selectedAlbum: String?): String {
         val albums = StorageEngine.listAllAlbumsRecursively(baseDir)
         val rootDir = StorageEngine.resolveRootDir(baseDir, createIfMissing = false)
 
-        // Se nenhuma pasta especifica foi clicada, exibe a Galeria Geral com todas as fotos
         val galleryItems = mutableListOf<Pair<String, File>>()
         if (selectedAlbum.isNullOrBlank()) {
             for (alb in albums) {
                 val dir = File(rootDir, StorageEngine.sanitizeRelativePath(alb.relativePath))
-                dir.listFiles { f -> isMediaFile(f) }
+                dir.listFiles { f -> StorageEngine.isMediaFile(f) }
                     ?.sortedByDescending { it.lastModified() }
                     ?.forEach { f -> galleryItems.add(alb.relativePath to f) }
             }
         } else {
             val dir = File(rootDir, StorageEngine.sanitizeRelativePath(selectedAlbum))
-            dir.listFiles { f -> isMediaFile(f) }
+            dir.listFiles { f -> StorageEngine.isMediaFile(f) }
                 ?.sortedByDescending { it.lastModified() }
                 ?.forEach { f -> galleryItems.add(selectedAlbum to f) }
         }
 
+        val totalAllPhotos = albums.sumOf { it.fileCount }
+        val currentAlbumParam = selectedAlbum.orEmpty()
+        val encCurrentAlbum = URLEncoder.encode(currentAlbumParam, "UTF-8")
+
         val sb = StringBuilder()
-        sb.append("<!DOCTYPE html><html lang='pt-BR'><head><meta charset='utf-8'>")
+        sb.append("<!DOCTYPE html><html lang='pt-PT'><head><meta charset='utf-8'>")
         sb.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
-        sb.append("<title>CamFLC • Galeria LAN (${getDeviceName()})</title>")
+        sb.append("<title>CamFLC Web • ${getDeviceName()}</title>")
         sb.append("<style>")
-        sb.append("body{font-family:sans-serif;background:#FFFFFF;color:#000000;margin:0;padding:20px;}")
-        sb.append(".header{background:#000000;color:#FFD600;padding:18px;border-radius:12px;margin-bottom:20px;}")
-        sb.append(".card{background:#F1F5F9;border:2px solid #000000;border-radius:12px;padding:16px;margin-bottom:16px;}")
-        sb.append(".btn{display:inline-block;background:#000000;color:#FFD600;padding:10px 14px;text-decoration:none;font-weight:bold;border-radius:8px;margin-right:8px;margin-top:6px;cursor:pointer;border:none;}")
-        sb.append(".btn-amber{background:#FFD600;color:#000000;border:2px solid #000000;}")
-        sb.append(".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-top:14px;}")
-        sb.append(".thumb-card{background:#FFFFFF;border:2px solid #000000;border-radius:10px;padding:8px;text-align:center;}")
-        sb.append(".thumb-card img{width:100%;height:140px;object-fit:cover;border-radius:6px;background:#000;}")
-        sb.append(".chk{transform:scale(1.6);margin-right:8px;cursor:pointer;}")
+        sb.append(":root{--bg:#F8FAFC;--card:#FFFFFF;--text:#0F172A;--sub:#475569;--border:#0F172A;--amber:#FFD600;--green:#00C853;--red:#D50000;}")
+        sb.append("body.dark{--bg:#0B0F19;--card:#1E293B;--text:#F8FAFC;--sub:#CBD5E1;--border:#475569;}")
+        sb.append("*{box-sizing:border-box;}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:16px;transition:background .2s;}")
+        sb.append(".topbar{background:#0B0F19;color:#FFFFFF;padding:16px 20px;border-radius:14px;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;border:2px solid var(--amber);}")
+        sb.append(".layout{display:grid;grid-template-columns:260px 1fr;gap:16px;}")
+        sb.append("@media(max-width:800px){.layout{grid-template-columns:1fr;}}")
+        sb.append(".panel{background:var(--card);border:2px solid var(--border);border-radius:14px;padding:16px;}")
+        sb.append(".folder-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-radius:10px;text-decoration:none;color:var(--text);font-weight:700;margin-bottom:6px;border:1.5px solid transparent;}")
+        sb.append(".folder-item:hover{border-color:var(--amber);}")
+        sb.append(".folder-item.active{background:var(--amber);color:#000000;border-color:#000000;}")
+        sb.append(".search-box{width:100%;padding:12px 16px;border-radius:10px;border:2px solid var(--border);background:var(--bg);color:var(--text);font-size:15px;font-weight:700;margin-bottom:12px;}")
+        sb.append(".toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:2px solid var(--border);margin-bottom:14px;}")
+        sb.append(".btn{display:inline-flex;align-items:center;gap:6px;background:#0F172A;color:var(--amber);padding:10px 14px;text-decoration:none;font-weight:800;font-size:13px;border-radius:10px;border:2px solid #0F172A;cursor:pointer;}")
+        sb.append(".btn-amber{background:var(--amber);color:#000000;border:2px solid #000000;}")
+        sb.append(".btn-green{background:var(--green);color:#000000;border:2px solid #000000;}")
+        sb.append(".btn-red{background:var(--red);color:#FFFFFF;border:2px solid #000000;}")
+        sb.append(".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;}")
+        sb.append(".photo-card{background:var(--bg);border:2px solid var(--border);border-radius:12px;padding:8px;position:relative;transition:transform .1s;}")
+        sb.append(".photo-card.selected{border:3px solid var(--green);background:rgba(0,200,83,0.12);}")
+        sb.append(".thumb-wrap{position:relative;width:100%;height:145px;background:#000;border-radius:8px;overflow:hidden;cursor:pointer;}")
+        sb.append(".thumb-wrap img{width:100%;height:100%;object-fit:cover;}")
+        sb.append(".chk{transform:scale(1.5);cursor:pointer;accent-color:var(--green);}")
+        sb.append(".modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:999;align-items:center;justify-content:center;padding:20px;flex-direction:column;}")
+        sb.append(".modal img{max-width:92vw;max-height:76vh;border-radius:10px;border:2px solid var(--amber);}")
         sb.append("</style>")
+
         sb.append("<script>")
-        sb.append("function toggleAll(source){const c=document.querySelectorAll('.photo-chk');for(let i=0;i<c.length;i++){c[i].checked=source.checked;}}")
-        sb.append("function downloadSelected(){const c=document.querySelectorAll('.photo-chk:checked');if(c.length===0){alert('Selecione pelo menos 1 foto!');return;}const arr=[];c.forEach(x=>arr.push(x.value));window.location.href='/api/zip_selected?items='+encodeURIComponent(arr.join('|'));}")
-        sb.append("</script></head><body>")
+        sb.append("function initTheme(){if(localStorage.getItem('camflc_theme')==='dark'){document.body.classList.add('dark');}}")
+        sb.append("function toggleTheme(){document.body.classList.toggle('dark');localStorage.setItem('camflc_theme',document.body.classList.contains('dark')?'dark':'light');}")
+        sb.append("function filterPhotos(){const q=document.getElementById('searchInput').value.toLowerCase();const cards=document.querySelectorAll('.photo-card');let visible=0;cards.forEach(c=>{const match=c.dataset.search.includes(q);c.style.display=match?'block':'none';if(match)visible++;});document.getElementById('visibleCount').innerText=visible;}")
+        sb.append("function updateSelectionCount(){const all=document.querySelectorAll('.photo-chk');let sel=0;all.forEach(x=>{const card=x.closest('.photo-card');if(x.checked){sel++;card.classList.add('selected');}else{card.classList.remove('selected');}});document.getElementById('selCount').innerText=sel;}")
+        sb.append("function toggleVisible(state){const cards=document.querySelectorAll('.photo-card');cards.forEach(c=>{if(c.style.display!=='none'){const chk=c.querySelector('.photo-chk');if(chk)chk.checked=state;}});updateSelectionCount();}")
+        sb.append("function getSelectedItems(){const c=document.querySelectorAll('.photo-chk:checked');const arr=[];c.forEach(x=>arr.push(x.value));return arr;}")
+        sb.append("function downloadSelected(){const arr=getSelectedItems();if(arr.length===0){alert('Selecione pelo menos 1 foto na grelha!');return;}window.location.href='/api/zip_selected?items='+encodeURIComponent(arr.join('|'));}")
+        sb.append("function deleteSelected(){const arr=getSelectedItems();if(arr.length===0){alert('Selecione pelo menos 1 foto!');return;}if(confirm('Eliminar permanentemente '+arr.length+' foto(s) selecionada(s)?')){window.location.href='/api/delete_selected?web=1&album=$encCurrentAlbum&items='+encodeURIComponent(arr.join('|'));}}")
+        sb.append("function openLightbox(url,title,sub){document.getElementById('lbImg').src=url;document.getElementById('lbTitle').innerText=title;document.getElementById('lbSub').innerText=sub;document.getElementById('lbDownload').href=url;document.getElementById('lightbox').style.display='flex';}")
+        sb.append("function closeLightbox(){document.getElementById('lightbox').style.display='none';document.getElementById('lbImg').src='';}")
+        sb.append("</script></head><body onload='initTheme()'>")
 
-        sb.append("<div class='header'>")
-        sb.append("<h2 style='margin:0;'>CamFLC • GALERIA & REDE LOCAL (${getDeviceName()})</h2>")
-        sb.append("<a class='btn btn-amber' href='/'>🖼 GALERIA GERAL (TODAS AS FOTOS)</a>")
-        sb.append("<a class='btn btn-amber' href='/api/zip?album='>⬇ BAIXAR TODAS AS PASTAS (.ZIP)</a>")
-        sb.append("</div>")
+        // Cabecalho Superior
+        sb.append("<div class='topbar'>")
+        sb.append("<div><h2 style='margin:0;color:var(--amber);'>📷 CamFLC Web • ${getDeviceName()}</h2>")
+        sb.append("<div style='font-size:13px;color:#CBD5E1;font-weight:700;'>Raiz: /storage/emulated/0/$baseDir • $totalAllPhotos fotos indexadas</div></div>")
+        sb.append("<div style='display:flex;gap:8px;flex-wrap:wrap;'>")
+        sb.append("<button class='btn btn-amber' onclick='toggleTheme()'>☀️/🌙 Alternar Tema</button>")
+        sb.append("<a class='btn btn-green' href='/api/zip?album='>⬇️ Transferir Tudo (.ZIP)</a>")
+        sb.append("</div></div>")
 
-        sb.append("<div class='card'><h3>1. FILTRAR POR PASTA / SUBPASTA (${albums.size})</h3>")
+        // Layout em 2 Colunas (Pastas na Esquerda | Galeria e Pesquisa na Direita)
+        sb.append("<div class='layout'>")
+
+        // Coluna 1: Filtro de Pastas e Subpastas
+        sb.append("<div class='panel'><h3 style='margin-top:0;'>📁 PASTAS (${albums.size})</h3>")
+        val allActiveClass = if (selectedAlbum.isNullOrBlank()) "folder-item active" else "folder-item"
+        sb.append("<a class='$allActiveClass' href='/'><span>🖼️ Todas as Fotos</span><span>$totalAllPhotos</span></a>")
+
         for (album in albums) {
             val enc = URLEncoder.encode(album.relativePath, "UTF-8")
-            val activeStyle = if (album.relativePath == selectedAlbum) "border:3px solid #00C853;" else ""
-            sb.append("<a class='btn' style='$activeStyle' href='/?album=$enc'>📁 ${album.relativePath} (${album.fileCount})</a>")
-        }
-        sb.append("</div>")
-
-        val titleGallery = if (selectedAlbum.isNullOrBlank()) {
-            "2. MODO GALERIA GERAL (${galleryItems.size} fotos em todas as pastas)"
-        } else {
-            "2. GALERIA DA PASTA '$selectedAlbum' (${galleryItems.size} fotos)"
+            val isAct = album.relativePath == selectedAlbum
+            val cls = if (isAct) "folder-item active" else "folder-item"
+            val icon = if (album.relativePath.contains("/")) "↳ 📂" else "📁"
+            sb.append("<a class='$cls' href='/?album=$enc'><span>$icon ${album.relativePath}</span><span>${album.fileCount}</span></a>")
         }
 
-        sb.append("<div class='card'>")
-        sb.append("<h3>$titleGallery</h3>")
-        sb.append("<div>")
-        sb.append("<label style='font-weight:bold;font-size:16px;margin-right:16px;'><input type='checkbox' class='chk' onclick='toggleAll(this)'> SELECIONAR TODAS</label>")
-        sb.append("<button class='btn btn-amber' onclick='downloadSelected()'>⬇ BAIXAR FOTOS SELECIONADAS (.ZIP)</button>")
         if (!selectedAlbum.isNullOrBlank()) {
-            val encAlb = URLEncoder.encode(selectedAlbum, "UTF-8")
-            sb.append("<a class='btn' href='/api/zip?album=$encAlb'>⬇ BAIXAR ESTA PASTA INTEIRA (.ZIP)</a>")
+            sb.append("<hr style='border-color:var(--border);margin:14px 0;'>")
+            sb.append("<a class='btn btn-amber' style='width:100%;justify-content:center;' href='/api/zip?album=$encCurrentAlbum'>⬇️ Baixar Pasta '$selectedAlbum' (.ZIP)</a>")
         }
         sb.append("</div>")
+
+        // Coluna 2: Pesquisa + Barra de Acoes em Lote + Grelha de Miniaturas
+        sb.append("<div class='panel'>")
+        sb.append("<input id='searchInput' type='text' class='search-box' oninput='filterPhotos()' placeholder='🔍 Pesquisar instantaneamente por prefixo, nome do ficheiro ou pasta...'>")
+
+        sb.append("<div class='toolbar'>")
+        sb.append("<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;'>")
+        sb.append("<button class='btn' onclick='toggleVisible(true)'>☑️ Marcar Visíveis</button>")
+        sb.append("<button class='btn' onclick='toggleVisible(false)'>⬜ Limpar</button>")
+        sb.append("<span style='font-weight:800;font-size:13px;'>Exibindo <span id='visibleCount'>${galleryItems.size}</span> • Selecionadas: <span id='selCount'>0</span></span>")
+        sb.append("</div>")
+
+        sb.append("<div style='display:flex;gap:8px;flex-wrap:wrap;'>")
+        sb.append("<button class='btn btn-amber' onclick='downloadSelected()'>⬇️ Baixar Selecionadas (.ZIP)</button>")
+        if (isRemoteDeleteAllowed()) {
+            sb.append("<button class='btn btn-red' onclick='deleteSelected()'>🗑️ Excluir Selecionadas</button>")
+        }
+        sb.append("</div></div>")
 
         sb.append("<div class='grid'>")
         for ((albPath, file) in galleryItems) {
             val encAlb = URLEncoder.encode(albPath, "UTF-8")
             val encFile = URLEncoder.encode(file.name, "UTF-8")
             val itemValue = "$albPath/${file.name}"
-            sb.append("<div class='thumb-card'>")
-            sb.append("<a target='_blank' href='/api/file?album=$encAlb&name=$encFile'>")
-            sb.append("<img loading='lazy' src='/api/thumb?album=$encAlb&name=$encFile' alt='${file.name}'>")
-            sb.append("</a>")
-            sb.append("<div style='margin-top:8px;text-align:left;font-size:12px;font-weight:bold;word-break:break-all;'>")
-            sb.append("<label><input type='checkbox' class='chk photo-chk' value=\"$itemValue\"> ${file.name}</label>")
-            sb.append("<div style='color:#555;margin-top:4px;'>📁 $albPath (${file.length() / 1024} KB)</div>")
+            val fullUrl = "/api/file?album=$encAlb&name=$encFile"
+            val thumbUrl = "/api/thumb?album=$encAlb&name=$encFile"
+            val kbSize = "${file.length() / 1024} KB"
+            val searchTokens = "${file.name} $albPath".lowercase(Locale.getDefault())
+
+            sb.append("<div class='photo-card' data-search=\"$searchTokens\">")
+            sb.append("<div class='thumb-wrap' onclick=\"openLightbox('$fullUrl','${file.name}','Pasta: $albPath • $kbSize')\">")
+            sb.append("<img loading='lazy' src='$thumbUrl' alt='${file.name}'>")
+            sb.append("</div>")
+            sb.append("<div style='margin-top:8px;display:flex;justify-content:space-between;align-items:flex-start;gap:6px;'>")
+            sb.append("<label style='font-size:12px;font-weight:800;word-break:break-all;cursor:pointer;flex:1;'>")
+            sb.append("<input type='checkbox' class='chk photo-chk' value=\"$itemValue\" onchange='updateSelectionCount()'> ${file.name}")
+            sb.append("</label></div>")
+            sb.append("<div style='display:flex;justify-content:space-between;align-items:center;margin-top:6px;font-size:11px;color:var(--sub);font-weight:700;'>")
+            sb.append("<span>📁 $albPath ($kbSize)</span>")
+            sb.append("<a href='$fullUrl' download='${file.name}' style='text-decoration:none;font-size:14px;' title='Baixar foto'>⬇️</a>")
             sb.append("</div></div>")
         }
-        sb.append("</div></div></body></html>")
+        sb.append("</div></div></div>")
+
+        // Modal Lightbox de Visualizacao em Alta Resolucao
+        sb.append("<div id='lightbox' class='modal' onclick='closeLightbox()'>")
+        sb.append("<img id='lbImg' src='' onclick='event.stopPropagation()'>")
+        sb.append("<div style='color:#FFF;text-align:center;margin-top:12px;' onclick='event.stopPropagation()'>")
+        sb.append("<div id='lbTitle' style='font-size:16px;font-weight:800;color:var(--amber);'></div>")
+        sb.append("<div id='lbSub' style='font-size:13px;margin-bottom:12px;'></div>")
+        sb.append("<a id='lbDownload' class='btn btn-amber' href='' download>⬇️ Guardar Imagem Original</a> ")
+        sb.append("<button class='btn' onclick='closeLightbox()'>✕ Fechar</button>")
+        sb.append("</div></div>")
+
+        sb.append("</body></html>")
         return sb.toString()
     }
 
@@ -612,7 +691,7 @@ class LanEngine(
     }
 
     // =========================================================================
-    // CLIENTE LAN: CONSULTA DE GALERIA, MINIATURAS E TRANSFERENCIA SELETIVA
+    // CLIENTE LAN: CONSULTA DE GALERIA REMOTA E TRANSFERENCIA SELETIVA
     // =========================================================================
 
     suspend fun fetchRemoteDeviceInfo(peerIp: String, peerPort: Int = HTTP_PORT): Result<Pair<String, List<AlbumInfo>>> =
@@ -648,7 +727,6 @@ class LanEngine(
             }
         }
 
-    // Busca fotos de uma pasta especifica OU de todas as pastas (Modo Galeria Geral quando albumRelativePath == null)
     suspend fun fetchRemoteGalleryFiles(
         peerIp: String,
         peerPort: Int = HTTP_PORT,
@@ -686,7 +764,6 @@ class LanEngine(
         }
     }
 
-    // Baixa a miniatura leve (~25KB) de uma foto remota para exibir na grade do celular
     suspend fun fetchRemoteThumbnailBitmap(
         peerIp: String,
         peerPort: Int = HTTP_PORT,
@@ -710,7 +787,6 @@ class LanEngine(
         }
     }
 
-    // Copia ou Transfere (Move) uma lista de fotos selecionadas (ou de uma pasta inteira) mantendo as respectivas pastas
     suspend fun syncSelectedFilesFromPeer(
         peerIp: String,
         peerPort: Int = HTTP_PORT,
@@ -725,7 +801,7 @@ class LanEngine(
 
             for ((index, remoteFile) in selectedFiles.withIndex()) {
                 withContext(Dispatchers.Main) {
-                    onProgress("Transferindo (${index + 1}/${selectedFiles.size}): ${remoteFile.name}...")
+                    onProgress("A transferir (${index + 1}/${selectedFiles.size}): ${remoteFile.name}...")
                 }
 
                 val targetAlbumDir = File(
@@ -792,6 +868,6 @@ class LanEngine(
             }
         } catch (_: Exception) {
         }
-        return "Sem Wi-Fi / Ative Wi-Fi ou Roteador"
+        return "Ative o Wi-Fi ou Ponto de Acesso"
     }
 }
