@@ -138,11 +138,12 @@ fun CamFLCApp(
 
     var albumsList by remember { mutableStateOf<List<AlbumInfo>>(emptyList()) }
     var storageRefreshTick by remember { mutableIntStateOf(0) }
-    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida.") }
+    var lastCaptureLog by remember { mutableStateOf("Pronto para captura rápida (0.15s).") }
 
     // 4 Abas Principais: 0 = Inicio | 1 = Camera Pro | 2 = Galeria Local | 3 = Rede LAN
     var currentTab by remember { mutableIntStateOf(0) }
     var initialGalleryFilePath by remember { mutableStateOf<String?>(null) }
+    var initialGalleryFolder by remember { mutableStateOf<String?>(null) }
 
     // Funcao auxiliar para salvar prefixo nos recentes
     val savePrefixToHistory: (String) -> Unit = { prefix ->
@@ -263,7 +264,6 @@ fun CamFLCApp(
     Scaffold(
         containerColor = if (isDarkMode) Color(0xFF0B0F19) else SolarWhite,
         topBar = {
-            // Barra Superior Compacta (Oculta apenas dentro da Camera Pro para dar mais espaco ao visor)
             if (currentTab != 1 || showCasualSettings) {
                 Surface(
                     color = topBarBg,
@@ -302,7 +302,6 @@ fun CamFLCApp(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            // Alternador Rapido de Tema: Sol Claro vs Escuro OLED
                             OutlinedButton(
                                 onClick = {
                                     isDarkMode = !isDarkMode
@@ -328,7 +327,6 @@ fun CamFLCApp(
                                 )
                             }
 
-                            // Botao para Abrir / Fechar as Configuracoes Casuais
                             IconButton(
                                 onClick = {
                                     showCasualSettings = !showCasualSettings
@@ -384,7 +382,10 @@ fun CamFLCApp(
                     )
                     NavigationBarItem(
                         selected = currentTab == 2,
-                        onClick = { currentTab = 2 },
+                        onClick = {
+                            initialGalleryFolder = activeFolder
+                            currentTab = 2
+                        },
                         icon = { Icon(Icons.Default.PhotoLibrary, contentDescription = null) },
                         label = { Text("GALERIA", fontWeight = FontWeight.ExtraBold, fontSize = 11.sp) },
                         colors = NavigationBarItemDefaults.colors(
@@ -418,7 +419,6 @@ fun CamFLCApp(
                 .padding(innerPadding)
         ) {
             if (showCasualSettings) {
-                // TELA 5: CONFIGURACOES CASUAIS (ISOLADA DA OPERACAO PRINCIPAL)
                 CasualSettingsScreen(
                     isDarkMode = isDarkMode,
                     onToggleDarkMode = {
@@ -508,7 +508,6 @@ fun CamFLCApp(
                 when (currentTab) {
                     0 -> QuickOperationHomeScreen(
                         isDarkMode = isDarkMode,
-                        baseDirectory = baseDirectory,
                         filePrefix = filePrefix,
                         recentPrefixes = recentPrefixes,
                         onPrefixChange = {
@@ -524,7 +523,18 @@ fun CamFLCApp(
                         activeFolder = activeFolder,
                         hasAllFilesAccess = hasAllFilesAccess,
                         hasCameraPermission = hasCameraPermission,
-                        onOpenPermissionsSettings = { showCasualSettings = true },
+                        onRequestImmediatePermissions = {
+                            permissionLauncher.launch(
+                                arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                            )
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                context.startActivity(intent)
+                            }
+                        },
                         onSelectFolder = { folderRelPath ->
                             activeFolder = folderRelPath
                             prefs.edit().putString("active_folder", folderRelPath).apply()
@@ -586,8 +596,9 @@ fun CamFLCApp(
                             lastCaptureLog = logMsg
                             storageRefreshTick++
                         },
-                        onOpenGallery = { focusedPath ->
+                        onOpenGallery = { focusedPath, folderToOpen ->
                             initialGalleryFilePath = focusedPath
+                            initialGalleryFolder = folderToOpen
                             currentTab = 2
                         },
                         onLaunchNativeCamera = launchNativeCamera,
@@ -599,7 +610,11 @@ fun CamFLCApp(
                         albumsList = albumsList,
                         activeFolder = activeFolder,
                         initialFocusedFilePath = initialGalleryFilePath,
-                        onClearInitialFocusedFile = { initialGalleryFilePath = null },
+                        initialFocusedFolder = initialGalleryFolder,
+                        onClearInitialFocus = {
+                            initialGalleryFilePath = null
+                            initialGalleryFolder = null
+                        },
                         isDarkMode = isDarkMode,
                         onSelectActiveFolder = { chosenFolder ->
                             activeFolder = chosenFolder
@@ -622,13 +637,13 @@ fun CamFLCApp(
                                     PeerDevice(name = cleanName, ip = cleanIp, isPaired = true))
                                 .sortedBy { it.ip }
                             pairedPeers = updated
-                            val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
+                            val serialized = updated.joinToString(";") { "${it.name}\vert{}${it.ip}" }
                             prefs.edit().putString("lan_paired_peers", serialized).apply()
                         },
                         onRemovePairedPeer = { targetIp ->
                             val updated = pairedPeers.filterNot { it.ip == targetIp }
                             pairedPeers = updated
-                            val serialized = updated.joinToString(";") { "${it.name}|${it.ip}" }
+                            val serialized = updated.joinToString(";") { "${it.name}\vert{}${it.ip}" }
                             prefs.edit().putString("lan_paired_peers", serialized).apply()
                         },
                         onTriggerRadarScan = { lanEngine.sendDiscoveryBroadcast() },
@@ -643,7 +658,6 @@ fun CamFLCApp(
 @Composable
 fun QuickOperationHomeScreen(
     isDarkMode: Boolean,
-    baseDirectory: String,
     filePrefix: String,
     recentPrefixes: List<String>,
     onPrefixChange: (String) -> Unit,
@@ -652,7 +666,7 @@ fun QuickOperationHomeScreen(
     activeFolder: String,
     hasAllFilesAccess: Boolean,
     hasCameraPermission: Boolean,
-    onOpenPermissionsSettings: () -> Unit,
+    onRequestImmediatePermissions: () -> Unit,
     onSelectFolder: (String) -> Unit,
     onAddFolder: (String, Boolean) -> Unit,
     useNativeCameraFallback: Boolean,
@@ -665,7 +679,9 @@ fun QuickOperationHomeScreen(
     val subTextColor = if (isDarkMode) Color(0xFFCBD5E1) else Color(0xFF334155)
     val borderColor = if (isDarkMode) Color(0xFF475569) else SolarBlack
 
+    var dropdownExpanded by remember { mutableStateOf(false) }
     var folderSearchQuery by remember { mutableStateOf("") }
+
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var createAsSubfolder by remember { mutableStateOf(true) }
     var newFolderNameInput by remember { mutableStateOf("") }
@@ -673,7 +689,7 @@ fun QuickOperationHomeScreen(
     val cleanPrefix = StorageEngine.sanitizePrefix(filePrefix)
     val activeAlbumInfo = albumsList.find { it.relativePath == activeFolder }
 
-    // Filtra as pastas exibidas pela barra de pesquisa rapida
+    // Filtra as pastas dentro da Lista Suspensa (Dropdown)
     val filteredAlbums = remember(albumsList, folderSearchQuery) {
         val q = folderSearchQuery.trim().lowercase(Locale.getDefault())
         if (q.isEmpty()) {
@@ -734,7 +750,6 @@ fun QuickOperationHomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Alerta enxuto caso falte alguma permissao inicial
         if (!hasAllFilesAccess || !hasCameraPermission) {
             Surface(
                 color = SolarAmber,
@@ -742,7 +757,7 @@ fun QuickOperationHomeScreen(
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onOpenPermissionsSettings() }
+                    .clickable { onRequestImmediatePermissions() }
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -750,7 +765,7 @@ fun QuickOperationHomeScreen(
                     modifier = Modifier.padding(12.dp)
                 ) {
                     Text(
-                        text = "⚠️ Toque aqui para ativar as permissões de Pastas e Câmera",
+                        text = "⚠️ Toque aqui para liberar Permissões de Pastas, Câmera e Áudio",
                         color = SolarBlack,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.ExtraBold,
@@ -784,49 +799,18 @@ fun QuickOperationHomeScreen(
                         fontWeight = FontWeight.ExtraBold
                     )
                     Text(
-                        text = "${activeAlbumInfo?.fileCount ?: 0} fotos",
+                        text = "${activeAlbumInfo?.fileCount ?: 0} arq",
                         color = SolarGreen,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
                 }
                 Text(
-                    text = "🏷️ Próximo arquivo: ${cleanPrefix}_AAAAMMDD_HHMMSS.jpg",
+                    text = "🏷️ Próximo arquivo: ${cleanPrefix}_AAAAMMDD_HHMMSS (.jpg / .mp4)",
                     color = SolarWhite,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
-            }
-        }
-
-        // BOTAO PRINCIPAL DE ACAO (ABRIR CAMERA PRO)
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Button(
-                onClick = onOpenProCamera,
-                colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
-                border = BorderStroke(2.dp, SolarBlack),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .height(62.dp)
-            ) {
-                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(26.dp))
-                Spacer(modifier = Modifier.width(10.dp))
-                Text("ABRIR CÂMERA PRO (VOL -)", fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
-            }
-
-            if (useNativeCameraFallback) {
-                OutlinedButton(
-                    onClick = onLaunchNativeCamera,
-                    border = BorderStroke(2.dp, borderColor),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.height(62.dp)
-                ) {
-                    Icon(Icons.Default.PhotoCameraBack, contentDescription = "Câmera Nativa", tint = textColor)
-                }
             }
         }
 
@@ -900,7 +884,7 @@ fun QuickOperationHomeScreen(
             }
         }
 
-        // 2. BLOCO DE USO FREQUENTE: SELECAO E BUSCA AGIL DE PASTAS / SUBPASTAS
+        // 2. BLOCO DE USO FREQUENTE: SELECAO DE PASTA ATIVA EM LISTA SUSPENSA (DROPDOWN)
         Card(
             colors = CardDefaults.cardColors(containerColor = cardColor),
             border = BorderStroke(1.5.dp, borderColor),
@@ -911,66 +895,161 @@ fun QuickOperationHomeScreen(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Row(
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "2. PASTA / SUBPASTA ATIVA (${filteredAlbums.size})",
-                        color = textColor,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.ExtraBold
-                    )
+                Text(
+                    text = "2. SELECIONAR PASTA / SUBPASTA ATIVA (${albumsList.size})",
+                    color = textColor,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Button(
-                            onClick = {
-                                createAsSubfolder = true
-                                showCreateFolderDialog = true
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.height(34.dp)
+                // Caixa da Lista Suspensa (Dropdown)
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    Surface(
+                        color = bgColor,
+                        border = BorderStroke(2.dp, SolarAmber),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(56.dp)
+                            .clickable { dropdownExpanded = true }
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 14.dp)
                         ) {
-                            Text("+ Subpasta", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.FolderSpecial,
+                                    contentDescription = null,
+                                    tint = SolarAmber,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(
+                                        text = activeFolder,
+                                        color = textColor,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "${activeAlbumInfo?.fileCount ?: 0} arquivos • ${activeAlbumInfo?.formattedSize() ?: "0 B"}",
+                                        color = subTextColor,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ArrowDropDown,
+                                contentDescription = "Abrir lista de pastas",
+                                tint = SolarAmber,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = dropdownExpanded,
+                        onDismissRequest = {
+                            dropdownExpanded = false
+                            folderSearchQuery = ""
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth(0.90f)
+                            .heightIn(max = 380.dp)
+                            .background(cardColor)
+                    ) {
+                        Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                            OutlinedTextField(
+                                value = folderSearchQuery,
+                                onValueChange = { folderSearchQuery = it },
+                                placeholder = { Text("Pesquisar pasta na lista...", color = subTextColor, fontSize = 12.sp) },
+                                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = textColor) },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         }
 
-                        OutlinedButton(
-                            onClick = {
-                                createAsSubfolder = false
-                                showCreateFolderDialog = true
-                            },
-                            border = BorderStroke(1.dp, borderColor),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.height(34.dp)
-                        ) {
-                            Text("+ Raiz", color = textColor, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                        filteredAlbums.forEach { album ->
+                            val isSelected = album.relativePath == activeFolder
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(
+                                            text = if (album.relativePath.contains("/")) "↳ 📂 ${album.relativePath}" else "📁 ${album.relativePath}",
+                                            color = if (isSelected) SolarAmber else textColor,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            fontSize = 14.sp
+                                        )
+                                        Text(
+                                            text = "${album.fileCount} arq • ${album.formattedSize()}",
+                                            color = if (isSelected) SolarGreen else subTextColor,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    onSelectFolder(album.relativePath)
+                                    dropdownExpanded = false
+                                    folderSearchQuery = ""
+                                }
+                            )
                         }
                     }
                 }
 
-                // Barra de Pesquisa de Pastas
-                OutlinedTextField(
-                    value = folderSearchQuery,
-                    onValueChange = { folderSearchQuery = it },
-                    placeholder = { Text("Filtrar pasta ou subpasta...", color = subTextColor, fontWeight = FontWeight.Bold) },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = textColor) },
-                    trailingIcon = {
-                        if (folderSearchQuery.isNotEmpty()) {
-                            IconButton(onClick = { folderSearchQuery = "" }) {
-                                Icon(Icons.Default.Clear, contentDescription = "Limpar", tint = textColor)
-                            }
-                        }
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(10.dp),
+                // Botoes Rapidos de Hierarquia: [+ Subpasta], [+ Raiz] e [Subir para Pasta Pai]
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
-                )
+                ) {
+                    Button(
+                        onClick = {
+                            createAsSubfolder = true
+                            showCreateFolderDialog = true
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                    ) {
+                        Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("+ SUBPASTA", fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                    }
 
-                // Botao rapido para subir para a pasta pai caso esteja numa subpasta
+                    OutlinedButton(
+                        onClick = {
+                            createAsSubfolder = false
+                            showCreateFolderDialog = true
+                        },
+                        border = BorderStroke(1.5.dp, borderColor),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                    ) {
+                        Icon(Icons.Default.Folder, contentDescription = null, tint = SolarAmber, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("+ PASTA RAIZ", color = textColor, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+
                 if (activeFolder.contains("/")) {
                     val parentFolder = activeFolder.substringBeforeLast("/")
                     OutlinedButton(
@@ -989,66 +1068,36 @@ fun QuickOperationHomeScreen(
                         )
                     }
                 }
+            }
+        }
 
-                // Grelha de Pastas em 2 Colunas (Muito mais facil de visualizar e tocar do que uma linha unica)
-                val rows = filteredAlbums.chunked(2)
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    rows.forEach { pair ->
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            pair.forEach { album ->
-                                val isSelected = album.relativePath == activeFolder
-                                val isSub = album.relativePath.contains("/")
-                                Surface(
-                                    color = if (isSelected) SolarAmber else bgColor,
-                                    border = BorderStroke(if (isSelected) 2.5.dp else 1.5.dp, if (isSelected) SolarBlack else borderColor),
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clickable { onSelectFolder(album.relativePath) }
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.padding(12.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = when {
-                                                isSelected -> Icons.Default.FolderSpecial
-                                                isSub -> Icons.Default.SubdirectoryArrowRight
-                                                else -> Icons.Default.Folder
-                                            },
-                                            contentDescription = null,
-                                            tint = if (isSelected) SolarBlack else SolarAmber,
-                                            modifier = Modifier.size(22.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Column {
-                                            Text(
-                                                text = album.relativePath,
-                                                color = if (isSelected) SolarBlack else textColor,
-                                                fontSize = 13.sp,
-                                                fontWeight = FontWeight.ExtraBold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            Text(
-                                                text = "${album.fileCount} arq • ${album.formattedSize()}",
-                                                color = if (isSelected) SolarBlack else subTextColor,
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                maxLines = 1
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                            if (pair.size == 1) {
-                                Spacer(modifier = Modifier.weight(1f))
-                            }
-                        }
-                    }
+        // BOTAO PRINCIPAL DE ACAO (ABRIR CAMERA PRO)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Button(
+                onClick = onOpenProCamera,
+                colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
+                border = BorderStroke(2.dp, SolarBlack),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(64.dp)
+            ) {
+                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(26.dp))
+                Spacer(modifier = Modifier.width(10.dp))
+                Text("ABRIR CÂMERA PRO (VOL -)", fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+            }
+
+            if (useNativeCameraFallback) {
+                OutlinedButton(
+                    onClick = onLaunchNativeCamera,
+                    border = BorderStroke(2.dp, borderColor),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.height(64.dp)
+                ) {
+                    Icon(Icons.Default.PhotoCameraBack, contentDescription = "Câmera Nativa", tint = textColor)
                 }
             }
         }
@@ -1060,289 +1109,4 @@ fun CasualSettingsScreen(
     isDarkMode: Boolean,
     onToggleDarkMode: (Boolean) -> Unit,
     baseDirectory: String,
-    onApplyBaseDir: (String) -> Unit,
-    activeFolder: String,
-    albumsCount: Int,
-    onRenameActiveFolder: (String) -> Unit,
-    onDeleteActiveFolder: () -> Unit,
-    onCleanGhostFolders: () -> Unit,
-    useNativeCameraFallback: Boolean,
-    onToggleNativeCamera: (Boolean) -> Unit,
-    deviceName: String,
-    onDeviceNameChange: (String) -> Unit,
-    allowRemoteDelete: Boolean,
-    onToggleRemoteDelete: (Boolean) -> Unit,
-    hasAllFilesAccess: Boolean,
-    hasCameraPermission: Boolean,
-    onRequestPermissions: () -> Unit,
-    onRefreshPermissions: () -> Unit,
-    statusLog: String,
-    onCloseSettings: () -> Unit
-) {
-    val bgColor = if (isDarkMode) Color(0xFF0B0F19) else SolarWhite
-    val cardColor = if (isDarkMode) Color(0xFF1E293B) else SolarSurface
-    val textColor = if (isDarkMode) SolarWhite else SolarBlack
-    val borderColor = if (isDarkMode) Color(0xFF475569) else SolarBlack
-
-    var draftBaseDir by remember(baseDirectory) { mutableStateOf(baseDirectory) }
-    var renameFolderText by remember(activeFolder) { mutableStateOf(activeFolder.substringAfterLast("/")) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(bgColor)
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        // 1. APARENCIA E COMPORTAMENTO DE CAMERA
-        Card(
-            colors = CardDefaults.cardColors(containerColor = cardColor),
-            border = BorderStroke(1.5.dp, borderColor),
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "1. APARÊNCIA E VISIBILIDADE",
-                    color = textColor,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "Modo Escuro OLED (Ambientes internos/noite)",
-                        color = textColor,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Switch(checked = isDarkMode, onCheckedChange = onToggleDarkMode)
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "Exibir botão auxiliar da Câmera Nativa do Sistema",
-                        color = textColor,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Switch(checked = useNativeCameraFallback, onCheckedChange = onToggleNativeCamera)
-                }
-            }
-        }
-
-        // 2. ARMAZENAMENTO BASE E MANUTENCAO DE PASTAS
-        Card(
-            colors = CardDefaults.cardColors(containerColor = cardColor),
-            border = BorderStroke(1.5.dp, borderColor),
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "2. DIRETÓRIO BASE E MANUTENÇÃO DE PASTAS",
-                    color = textColor,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    listOf("DCIM/CamFLC", "Pictures/CamFLC", "Documents/CamFLC").forEach { preset ->
-                        val selected = baseDirectory == preset
-                        Surface(
-                            color = if (selected) SolarAmber else bgColor,
-                            border = BorderStroke(1.5.dp, if (selected) SolarBlack else borderColor),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable {
-                                    draftBaseDir = preset
-                                    onApplyBaseDir(preset)
-                                }
-                        ) {
-                            Text(
-                                text = preset.substringBefore("/"),
-                                color = if (selected) SolarBlack else textColor,
-                                fontWeight = FontWeight.ExtraBold,
-                                fontSize = 12.sp,
-                                modifier = Modifier.padding(vertical = 10.dp, horizontal = 8.dp)
-                            )
-                        }
-                    }
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = draftBaseDir,
-                        onValueChange = { draftBaseDir = it },
-                        label = { Text("Caminho Base Personalizado", fontWeight = FontWeight.Bold) },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Button(
-                        onClick = { onApplyBaseDir(draftBaseDir) },
-                        colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
-                        modifier = Modifier.height(54.dp)
-                    ) {
-                        Text("APLICAR", fontWeight = FontWeight.ExtraBold)
-                    }
-                }
-
-                Divider(color = borderColor, thickness = 1.dp)
-
-                Button(
-                    onClick = onCleanGhostFolders,
-                    colors = ButtonDefaults.buttonColors(containerColor = SolarGreen, contentColor = SolarBlack),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                ) {
-                    Icon(Icons.Default.CleaningServices, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("LIMPAR TODAS AS PASTAS VAZIAS (0 ARQ)", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = renameFolderText,
-                        onValueChange = { renameFolderText = it },
-                        label = { Text("Renomear pasta ativa ('$activeFolder')", fontWeight = FontWeight.Bold) },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Button(
-                        onClick = { onRenameActiveFolder(renameFolderText) },
-                        colors = ButtonDefaults.buttonColors(containerColor = SolarBlack, contentColor = SolarAmber),
-                        modifier = Modifier.height(54.dp)
-                    ) {
-                        Text("RENOMEAR", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
-                    }
-                }
-
-                if (albumsCount > 1) {
-                    OutlinedButton(
-                        onClick = onDeleteActiveFolder,
-                        border = BorderStroke(1.5.dp, SolarRed),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.DeleteForever, contentDescription = null, tint = SolarRed)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("EXCLUIR PASTA ATIVA '$activeFolder'", color = SolarRed, fontWeight = FontWeight.ExtraBold)
-                    }
-                }
-            }
-        }
-
-        // 3. IDENTIFICACAO DE REDE E PERMISSOES DO SISTEMA
-        Card(
-            colors = CardDefaults.cardColors(containerColor = cardColor),
-            border = BorderStroke(1.5.dp, borderColor),
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "3. REDE LAN E PERMISSÕES ANDROID",
-                    color = textColor,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-
-                OutlinedTextField(
-                    value = deviceName,
-                    onValueChange = onDeviceNameChange,
-                    label = { Text("Nome deste Dispositivo na Rede LAN", fontWeight = FontWeight.Bold) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "Permitir que dispositivos na rede movam/excluam fotos daqui",
-                        color = textColor,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Switch(checked = allowRemoteDelete, onCheckedChange = onToggleRemoteDelete)
-                }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = onRequestPermissions,
-                        colors = ButtonDefaults.buttonColors(containerColor = SolarBlack, contentColor = SolarAmber),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("PERMISSÕES ANDROID", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
-                    }
-                    OutlinedButton(
-                        onClick = onRefreshPermissions,
-                        border = BorderStroke(1.5.dp, borderColor)
-                    ) {
-                        Text("VERIFICAR", color = textColor, fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
-                    }
-                }
-
-                Surface(
-                    color = SolarBlack,
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = statusLog,
-                        color = SolarGreen,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-            }
-        }
-
-        Button(
-            onClick = onCloseSettings,
-            colors = ButtonDefaults.buttonColors(containerColor = SolarAmber, contentColor = SolarBlack),
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(54.dp)
-        ) {
-            Icon(Icons.Default.Check, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("CONCLUIR E VOLTAR À OPERAÇÃO", fontWeight = FontWeight.ExtraBold)
-        }
-    }
-}
+    onApplyBaseDir
