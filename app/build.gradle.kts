@@ -11,8 +11,8 @@ android {
         applicationId = "com.camflc.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.3.0-Marco3"
+        versionCode = 5
+        versionName = "2.0.0-ProHardware"
     }
 
     buildTypes {
@@ -51,10 +51,11 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Motor Profissional de Camera (CameraX + Camera2 Hardware Interop)
+    // Motor Completo de Hardware de Camera e Video (CameraX + Camera2 Interop + Video Recorder)
     val cameraVersion = "1.3.4"
     implementation("androidx.camera:camera-core:$cameraVersion")
     implementation("androidx.camera:camera-camera2:$cameraVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraVersion")
+    implementation("androidx.camera:camera-video:$cameraVersion")
     implementation("androidx.camera:camera-view:$cameraVersion")
 }
